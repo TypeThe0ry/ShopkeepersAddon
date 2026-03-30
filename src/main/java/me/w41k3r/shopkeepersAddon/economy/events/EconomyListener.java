@@ -40,6 +40,7 @@ import static me.w41k3r.shopkeepersAddon.economy.EconomyManager.formatPrice;
 import static me.w41k3r.shopkeepersAddon.economy.EconomyManager.hasMoney;
 import static me.w41k3r.shopkeepersAddon.economy.PersistantDataManager.getPrice;
 import static me.w41k3r.shopkeepersAddon.economy.PersistantDataManager.isEconomyItem;
+import me.w41k3r.shopkeepersAddon.economy.DailyEarningsManager;
 import me.w41k3r.shopkeepersAddon.economy.objects.ShopEditTask;
 import static me.w41k3r.shopkeepersAddon.gui.managers.Utils.removeEconomyItem;
 import static me.w41k3r.shopkeepersAddon.gui.managers.Utils.setItemsOnTradeSlots;
@@ -84,6 +85,10 @@ public class EconomyListener implements Listener {
 
         if (isEconomyItem(firstIngredient)) {
             if (!hasMoney(player, getPrice(firstIngredient))) {
+                
+                // Show red 'X' lock visual
+                recipe.setUses(recipe.getMaxUses());
+                
                 sendPlayerMessage(player, config.getString("messages.noMoney", "You don't have enough money!"));
                 event.setCancelled(true);
                 return;
@@ -95,7 +100,25 @@ public class EconomyListener implements Listener {
              if (shopkeeper instanceof PlayerShopkeeper) {
                  double price = getPrice(recipe.getResult());
                  if (getOwnerMoney(shopkeeper) < price) {
+                     
+                     // Show red 'X' lock visual
+                     recipe.setUses(recipe.getMaxUses());
+                     
                      sendPlayerMessage(player, config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
+                     event.setCancelled(true);
+                     return;
+                 }
+             } else if (shopkeeper instanceof AdminShopkeeper && DailyEarningsManager.isLimitEnabled()) {
+                 double price = getPrice(recipe.getResult());
+                 if (DailyEarningsManager.getRemainingLimit(player) < price) {
+                     double remaining = DailyEarningsManager.getRemainingLimit(player);
+                     
+                     // Show red 'X' lock visual
+                     recipe.setUses(recipe.getMaxUses());
+                     
+                     sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "§cYou have reached your daily earning limit of %limit%!")
+                             .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
+                             .replace("%remaining%", formatPrice(remaining)));
                      event.setCancelled(true);
                      return;
                  }
@@ -309,6 +332,15 @@ public class EconomyListener implements Listener {
 
         int maxTrades = calculateMaxTrades(event, recipe, shopkeeper, pricePerTrade);
         if (maxTrades <= 0) {
+            if (isAdminShopkeeper && DailyEarningsManager.isLimitEnabled() && DailyEarningsManager.getRemainingLimit(player) < pricePerTrade) {
+                double remaining = DailyEarningsManager.getRemainingLimit(player);
+                sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "§cYou have reached your daily earning limit of %limit%!")
+                        .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
+                        .replace("%remaining%", formatPrice(remaining)));
+                
+                // Show red 'X' visual
+                recipe.setUses(recipe.getMaxUses());
+            }
             event.setCancelled(true);
             return;
         }
@@ -316,6 +348,19 @@ public class EconomyListener implements Listener {
         double totalPrice = pricePerTrade * maxTrades;
 
         if (isAdminShopkeeper) {
+            if (DailyEarningsManager.isLimitEnabled()) {
+                double remaining = DailyEarningsManager.getRemainingLimit(player);
+                if (remaining < pricePerTrade) {
+                    sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "§cYou have reached your daily earning limit of %limit%!")
+                            .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
+                            .replace("%remaining%", formatPrice(remaining)));
+                    event.setCancelled(true);
+                    
+                    // Show red 'X' visual
+                    recipe.setUses(recipe.getMaxUses());
+                    return;
+                }
+            }
             handleAdminTrade(event, recipe, player, maxTrades, totalPrice);
         } else {
             handlePlayerShopTrade(event, recipe, player, shopkeeper, maxTrades, totalPrice);
@@ -332,6 +377,13 @@ public class EconomyListener implements Listener {
 
         if (event.isShiftClick()) {
             maxTrades = calculateShiftClickTrades(event, recipe, shopkeeper, pricePerTrade);
+        }
+
+        if (shopkeeper instanceof AdminShopkeeper && DailyEarningsManager.isLimitEnabled()) {
+            Player player = (Player) event.getWhoClicked();
+            double remaining = DailyEarningsManager.getRemainingLimit(player);
+            int affordableByLimit = (int) Math.floor(remaining / pricePerTrade);
+            maxTrades = Math.min(maxTrades, affordableByLimit);
         }
 
         return Math.min(maxTrades, 64); // Cap at stack size
@@ -391,6 +443,9 @@ public class EconomyListener implements Listener {
     private void handleAdminTrade(InventoryClickEvent event, MerchantRecipe recipe, Player player, int maxTrades,
             double totalPrice) {
         EconomyManager.giveMoney(player.getName(), totalPrice);
+        if (DailyEarningsManager.isLimitEnabled()) {
+            DailyEarningsManager.addEarnings(player, totalPrice);
+        }
         removeIngredients(event.getClickedInventory(), recipe, maxTrades);
     }
 
@@ -399,6 +454,10 @@ public class EconomyListener implements Listener {
         
         double ownerMoney = getOwnerMoney(shopkeeper);
         if (ownerMoney < totalPrice) {
+            
+            // Show red 'X' visual
+            recipe.setUses(recipe.getMaxUses());
+            
             sendPlayerMessage(player,
                     config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
             event.setCancelled(true);

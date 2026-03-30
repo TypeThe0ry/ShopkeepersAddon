@@ -36,7 +36,6 @@ public final class ShopkeepersAddon extends JavaPlugin {
     private static final String CONFIG_BLACKLIST_PATH = "playerShops.itemBlacklist";
     private static final String BACKUP_FOLDER_NAME = "backups";
     private static final String CONFIG_VERSION_PATH = "config-version";
-    private static final double CURRENT_CONFIG_VERSION = 1.3;
 
     public static FileConfiguration config;
     public static ShopkeepersAddon plugin;
@@ -134,6 +133,8 @@ public final class ShopkeepersAddon extends JavaPlugin {
             initCommands();
             initEvents();
 
+            me.w41k3r.shopkeepersAddon.economy.DailyEarningsManager.initialize();
+
             logger.info("Fetching shopkeepers...");
             fetchShopkeepers();
 
@@ -170,31 +171,35 @@ public final class ShopkeepersAddon extends JavaPlugin {
 
     private static void updateConfig() {
         try {
+            InputStream defaultConfigStream = plugin.getResource("config.yml");
+            if (defaultConfigStream == null) {
+                logger.warning("Default config.yml not found inside the plugin jar!");
+                return;
+            }
+
+            FileConfiguration defaultConfig = YamlConfiguration.loadConfiguration(
+                    new InputStreamReader(defaultConfigStream));
+            
+            double latestVersion = defaultConfig.getDouble(CONFIG_VERSION_PATH, 0.0);
             double currentVersion = config.getDouble(CONFIG_VERSION_PATH, 0.0);
 
-            if (currentVersion < CURRENT_CONFIG_VERSION) {
+            if (currentVersion < latestVersion) {
                 createConfigBackup();
-                logger.info("Updating config from version " + currentVersion + " to " + CURRENT_CONFIG_VERSION);
-                InputStream defaultConfigStream = plugin.getResource("config.yml");
-                if (defaultConfigStream == null) {
-                    logger.warning("Default config.yml not found inside the plugin jar!");
-                    return;
-                }
-                FileConfiguration defaultConfig = YamlConfiguration.loadConfiguration(
-                        new InputStreamReader(defaultConfigStream));
+                logger.info("Updating config from version " + currentVersion + " to " + latestVersion);
 
                 boolean configChanged = addMissingKeysSimple(config, defaultConfig);
                 if (removeUnusedKeys(config, defaultConfig)) {
                     configChanged = true;
                 }
 
-                config.set(CONFIG_VERSION_PATH, CURRENT_CONFIG_VERSION);
+                config.set(CONFIG_VERSION_PATH, latestVersion);
+                configChanged = true;
 
                 if (configChanged) {
                     saveUpdatedConfig(config); // Write changes to disk
                     plugin.reloadConfig(); // Reload from disk
                     config = plugin.getConfig(); // Refresh reference
-                    logger.info("Config updated successfully to version " + CURRENT_CONFIG_VERSION);
+                    logger.info("Config updated successfully to version " + latestVersion);
                 } else {
                     logger.info("Config was already up to date");
                 }

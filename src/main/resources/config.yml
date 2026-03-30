@@ -1,7 +1,7 @@
 #----------------------------------------------
 # DO NOT TOUCH THESE UNLESS YOU KNOW WHAT YOU'RE DOING!
 debug: false
-config-version: 1.3
+config-version: 1.6
 #----------------------------------------------
 
 # You can edit from here:
@@ -39,6 +39,11 @@ economy:
   enabled: true
   # Set the price limit for trades
   selling-price-limit: 100000000.00
+
+  # Daily earnings limit for selling to admin shops
+  daily-earning-limit:
+    enabled: true
+    limit: 1000.00
 
   # Price formatting options
   price-format:
@@ -86,6 +91,7 @@ messages:
   noMoneyOwner: "§cThe shop owner doesn't have enough money to sell this item!"
   buySuccess: "§aYou have bought %item% for %price%."
   sellSuccess: "§aYou have sold %item% for %price%."
+  dailyLimitReached: "§cDaily earning limit reached! You can only earn %remaining% more today (Limit: %limit%)."
   setPrice: "§aPlease enter the new price for this item:"
   invalidPrice: "§cInvalid price! Please enter a valid number."
   priceChanged: "§aPrice changed successfully!"

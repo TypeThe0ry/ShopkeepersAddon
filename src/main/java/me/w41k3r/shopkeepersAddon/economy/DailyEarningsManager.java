@@ -51,13 +51,17 @@ public class DailyEarningsManager {
 
     public static double getEarnings(Player player) {
         checkDateReset();
-        return dataConfig.getDouble(EARNINGS_PATH + "." + player.getUniqueId(), 0.0D);
+        return getEarningsWithoutReset(player);
     }
 
     public static void addEarnings(Player player, double amount) {
         checkDateReset();
-        dataConfig.set(EARNINGS_PATH + "." + player.getUniqueId(), getEarnings(player) + amount);
+        dataConfig.set(EARNINGS_PATH + "." + player.getUniqueId(), getEarningsWithoutReset(player) + amount);
         saveData();
+    }
+
+    private static double getEarningsWithoutReset(Player player) {
+        return dataConfig.getDouble(EARNINGS_PATH + "." + player.getUniqueId(), 0.0D);
     }
 
     public static boolean isLimitEnabled() {

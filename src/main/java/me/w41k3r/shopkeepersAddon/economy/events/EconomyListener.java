@@ -4,6 +4,9 @@ import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
@@ -57,6 +60,8 @@ public class EconomyListener implements Listener {
     private static final String SHOPKEEPERS_DATA_PATH = "Shopkeepers/data/save.yml";
 
     private static final String OWNER_UUID_PATH = ".owner uuid";
+
+    private static final ConcurrentMap<Class<?>, Optional<Method>> META_GET_AS_STRING_METHODS = new ConcurrentHashMap<>();
 
     @EventHandler
     public void onOpenEditorUI(ShopkeeperOpenUIEvent event) {
@@ -327,40 +332,9 @@ public class EconomyListener implements Listener {
         }
     }
 
-    private boolean isTradingUISlot(InventoryClickEvent event, Player player) {
-        if (event.getRawSlot() != 2) {
-            return false;
-        }
-        if (!(getMerchantInventory(event) instanceof MerchantInventory merchantInventory)) {
-            return false;
-        }
-        MerchantRecipe recipe = merchantInventory.getSelectedRecipe();
-        return recipe != null && recipe.getResult() != null && isEconomyItem(recipe.getResult()) &&
-                ShopkeepersAPI.getUIRegistry().getUISession(player) != null &&
-                ShopkeepersAPI.getUIRegistry().getUISession(player).getUIType() == ShopkeepersAPI.getDefaultUITypes()
-                        .getTradingUIType();
-    }
-
     private boolean isEconomyItemClick(InventoryClickEvent event, Player player) {
         return isEconomyItem(event.getCurrentItem()) &&
                 ShopkeepersAPI.getUIRegistry().getUISession(player) == null;
-    }
-
-    private void handleTradingUIClick(InventoryClickEvent event, Player player) {
-        MerchantInventory merchantInventory = (MerchantInventory) getMerchantInventory(event);
-        MerchantRecipe recipe = merchantInventory.getSelectedRecipe();
-
-        if (recipe == null || recipe.getIngredients().isEmpty() || recipe.getResult() == null) {
-            return;
-        }
-
-        if (isEconomyItem(recipe.getResult())) {
-            processEconomyTradeClick(event, player, recipe);
-        }
-    }
-
-    private void processEconomyTradeClick(InventoryClickEvent event, Player player, MerchantRecipe recipe) {
-        processEconomyTradeClick(event, player, recipe, null);
     }
 
     private void processEconomyTradeClick(InventoryClickEvent event, Player player, MerchantRecipe recipe,
@@ -474,16 +448,6 @@ public class EconomyListener implements Listener {
             }
         }
 
-        Inventory inventory = getMerchantInventory(event);
-        if (inventory instanceof MerchantInventory merchantInventory) {
-            for (int slot = 0; slot <= 1; slot++) {
-                addSellInputIngredient(ingredients, merchantInventory.getItem(slot));
-            }
-            if (!ingredients.isEmpty()) {
-                return ingredients;
-            }
-        }
-
         if (merchantRecipe != null && merchantRecipe.getIngredients() != null) {
             for (ItemStack ingredient : merchantRecipe.getIngredients()) {
                 addSellIngredient(ingredients, ingredient);
@@ -495,6 +459,16 @@ public class EconomyListener implements Listener {
                 if (!isEmpty(ingredient)) {
                     ingredients.add(ingredient.clone());
                 }
+            }
+            if (!ingredients.isEmpty()) {
+                return ingredients;
+            }
+        }
+
+        Inventory inventory = getMerchantInventory(event);
+        if (inventory instanceof MerchantInventory merchantInventory) {
+            for (int slot = 0; slot <= 1; slot++) {
+                addSellInputIngredient(ingredients, merchantInventory.getItem(slot));
             }
         }
 
@@ -509,14 +483,8 @@ public class EconomyListener implements Listener {
 
     private void addSellInputIngredient(List<ItemStack> ingredients, ItemStack item) {
         if (!isEmpty(item) && !isEconomyItem(item)) {
-            ItemStack ingredient = item.clone();
-            ingredient.setAmount(1);
-            ingredients.add(ingredient);
+            ingredients.add(item.clone());
         }
-    }
-
-    private int countSimilarItems(Inventory inventory, ItemStack target) {
-        return countMatching(inventory, target);
     }
 
     private int getInputTradeCount(InventoryClickEvent event) {
@@ -765,15 +733,6 @@ public class EconomyListener implements Listener {
         return sameCustomModelData(item, target);
     }
 
-    private boolean sameMetaValue(ItemStack item, ItemStack target, String key) {
-        String itemValue = getMetaValue(item, key);
-        String targetValue = getMetaValue(target, key);
-        if (targetValue == null) {
-            return itemValue == null;
-        }
-        return targetValue.equals(itemValue);
-    }
-
     private boolean sameCustomModelData(ItemStack item, ItemStack target) {
         String itemValue = getCustomModelDataValue(item);
         String targetValue = getCustomModelDataValue(target);
@@ -876,11 +835,22 @@ public class EconomyListener implements Listener {
             return null;
         }
         try {
-            Method method = meta.getClass().getMethod("getAsString");
-            Object value = method.invoke(meta);
-            return value == null ? null : value.toString();
+            Optional<Method> method = META_GET_AS_STRING_METHODS.computeIfAbsent(meta.getClass(),
+                    EconomyListener::findGetAsStringMethod);
+            if (method.isPresent()) {
+                Object value = method.get().invoke(meta);
+                return value == null ? null : value.toString();
+            }
         } catch (ReflectiveOperationException ignored) {
-            return meta.toString();
+        }
+        return meta.toString();
+    }
+
+    private static Optional<Method> findGetAsStringMethod(Class<?> metaClass) {
+        try {
+            return Optional.of(metaClass.getMethod("getAsString"));
+        } catch (NoSuchMethodException | SecurityException ignored) {
+            return Optional.empty();
         }
     }
 
@@ -1004,9 +974,6 @@ public class EconomyListener implements Listener {
         }
         String displayName = item.getItemMeta().getDisplayName();
         return displayName.isEmpty() ? item.getType().name() : displayName;
-    }
-
-    private void removeIngredients(Inventory inventory, MerchantRecipe recipe, int multiplier) {
     }
 
     private void depositIngredientsToContainer(Shopkeeper shopkeeper, List<ItemStack> ingredients, int multiplier) {

@@ -4,6 +4,7 @@ import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -56,6 +57,10 @@ import static me.w41k3r.shopkeepersAddon.gui.managers.Utils.setItemsOnTradeSlots
 public class EconomyListener implements Listener {
 
     private static final int REMOVE_ECONOMY_ITEM_DELAY = 1;
+    private static final String BUY_SUCCESS_FALLBACK = "§aYou have bought %item% for %price%.";
+    private static final String DAILY_LIMIT_FALLBACK = "§cDaily earning limit reached! You can only earn %remaining% more today (Limit: %limit%).";
+    private static final String ERROR_FALLBACK = "&cAn error occurred while processing the transaction.";
+    private static final String INVENTORY_FULL_FALLBACK = "§cYou don't have enough inventory space for this trade.";
 
     private static final String SHOPKEEPERS_DATA_PATH = "Shopkeepers/data/save.yml";
 
@@ -128,7 +133,7 @@ public class EconomyListener implements Listener {
                      // Show red 'X' lock visual
                      recipe.setUses(recipe.getMaxUses());
                      
-                     sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾剧懓顪冪€ｎ亝鎹ｉ柣顓炴闇夐柨婵嗙墛椤忕姷绱掗埀顒佺節閸屾鏂€闂佺粯顭堝鎾存交鐟欏嫮绠鹃柟瀵稿仧椤ｈ尙鈧娲栭ˇ鐢稿蓟閺囩喓绠剧憸宥夊疮椤愩倖鍠嗛柨鏃€鍨濈换鍡涙煟閹板吀绨婚柍褜鍓氶崹鍨暦閹邦儵鏃堝川椤撶媭妲烽梻?have reached your daily earning limit of %limit%!")
+                     sendPlayerMessage(player, config.getString("messages.dailyLimitReached", DAILY_LIMIT_FALLBACK)
                              .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
                              .replace("%remaining%", formatPrice(remaining)));
                      event.setCancelled(true);
@@ -144,14 +149,27 @@ public class EconomyListener implements Listener {
         if (isEconomyItem(recipe.getResultItem().copy())) {
             event.setCancelled(true);
             InventoryClickEvent clickEvent = event.getClickEvent();
+            boolean processed = false;
+            String failureReason = null;
             if (clickEvent != null) {
                 Inventory merchantInventory = getMerchantInventory(clickEvent);
                 if (merchantInventory instanceof MerchantInventory merchant) {
                     MerchantRecipe selectedRecipe = merchant.getSelectedRecipe();
                     if (selectedRecipe != null) {
                         processEconomyTradeClick(clickEvent, event.getPlayer(), selectedRecipe, recipe);
+                        processed = true;
+                    } else {
+                        failureReason = "merchant inventory did not have a selected recipe";
                     }
+                } else {
+                    failureReason = "click event did not expose a merchant inventory";
                 }
+            } else {
+                failureReason = "trade event did not include a click event";
+            }
+            if (!processed) {
+                sendPlayerMessage(event.getPlayer(), config.getString("messages.error", ERROR_FALLBACK));
+                debugLog("Cancelled economy-result trade without processing it: " + failureReason);
             }
             debugLog("Handled trade with economy item as result.");
             return;
@@ -205,11 +223,8 @@ public class EconomyListener implements Listener {
         if (!(shopkeeper instanceof AdminShopkeeper)) {
             depositToShopOwner(shopkeeper, price);
         }
-        sendPlayerMessage(player, config.getString("messages.buySuccess", "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾剧懓顪冪€ｎ亝鎹ｉ柣顓炴闇夐柨婵嗙墛椤忕姷绱掗埀顒佺節閸屾鏂€闂佺粯顭堝鎾存交鐟欏嫮绠鹃柟瀵稿仧椤ｈ尙鈧娲栭ˇ鐢稿蓟閺囩喓绡€闊洦娲滈弳鐘绘煙閸忓吋缍戦柨鏇樺€濋崺鐐哄箣閿旂粯鏅╅梺鑺ッˇ閬嶆偡閵娿儺娓婚柕鍫濆€瑰▍鍥ㄣ亜?have purchased %item% for %price%.")
-                .replace("%item%",
-                        recipe.getResultItem().getItemMeta().getDisplayName().isEmpty()
-                                ? recipe.getResultItem().getType().name()
-                                : recipe.getResultItem().getItemMeta().getDisplayName())
+        sendPlayerMessage(player, config.getString("messages.buySuccess", BUY_SUCCESS_FALLBACK)
+                .replace("%item%", getItemDisplayNameSafe(recipe.getResultItem()))
                 .replace("%price%", formatPrice(price)));
         return true;
     }
@@ -277,16 +292,22 @@ public class EconomyListener implements Listener {
             return;
         }
 
+        ItemStack resultItem = recipe.getResultItem().copy();
+        resultItem.setAmount(tradeCount * resultItem.getAmount());
+
+        if (!canFitItem(player.getInventory(), resultItem)) {
+            sendPlayerMessage(player, config.getString("messages.inventoryFull", INVENTORY_FULL_FALLBACK));
+            return;
+        }
+
         if (!consumeSecondIngredientNow(event, recipe, tradeCount)) {
             return;
         }
 
         EconomyManager.takeMoney(player.getName(), totalPrice);
 
-        ItemStack resultItem = recipe.getResultItem().copy();
-        resultItem.setAmount(tradeCount * resultItem.getAmount());
-
-        player.getInventory().addItem(resultItem);
+        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(resultItem);
+        dropLeftovers(player, leftovers);
         if (!(shopkeeper instanceof AdminShopkeeper)) {
             PlayerShopkeeper playerShopkeeper = (PlayerShopkeeper) shopkeeper;
             if (playerShopkeeper.getContainer().getState() instanceof Container cont) {
@@ -297,7 +318,7 @@ public class EconomyListener implements Listener {
 
         }
 
-        sendPlayerMessage(player, config.getString("messages.buySuccess", "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾剧懓顪冪€ｎ亝鎹ｉ柣顓炴闇夐柨婵嗙墛椤忕姷绱掗埀顒佺節閸屾鏂€闂佺粯顭堝鎾存交鐟欏嫮绠鹃柟瀵稿仧椤ｈ尙鈧娲栭ˇ鐢稿蓟閺囩喓绡€闊洦娲滈弳鐘绘煙閸忓吋缍戦柨鏇樺€濋崺鐐哄箣閿旂粯鏅╅梺鑺ッˇ閬嶆偡閵娿儺娓婚柕鍫濆€瑰▍鍥ㄣ亜?have purchased %item% for %price%.")
+        sendPlayerMessage(player, config.getString("messages.buySuccess", BUY_SUCCESS_FALLBACK)
                 .replace("%item%", getItemDisplayNameSafe(recipe.getResultItem()))
                 .replace("%price%", formatPrice(totalPrice)));
 
@@ -306,6 +327,41 @@ public class EconomyListener implements Listener {
                 updateTradeSlotsPostTrade(player, recipe, shopkeeper);
             }
         }, 1L);
+    }
+
+    private boolean canFitItem(Inventory inventory, ItemStack item) {
+        if (inventory == null || isEmpty(item)) {
+            return false;
+        }
+
+        int remaining = item.getAmount();
+        int maxStackSize = Math.min(inventory.getMaxStackSize(), item.getMaxStackSize());
+        if (maxStackSize <= 0) {
+            return false;
+        }
+        for (ItemStack content : inventory.getStorageContents()) {
+            if (remaining <= 0) {
+                return true;
+            }
+            if (isEmpty(content)) {
+                remaining -= maxStackSize;
+            } else if (content.isSimilar(item) && content.getAmount() < maxStackSize) {
+                remaining -= maxStackSize - content.getAmount();
+            }
+        }
+        return remaining <= 0;
+    }
+
+    private void dropLeftovers(Player player, Map<Integer, ItemStack> leftovers) {
+        if (leftovers == null || leftovers.isEmpty()) {
+            return;
+        }
+        for (ItemStack leftover : leftovers.values()) {
+            if (!isEmpty(leftover)) {
+                player.getWorld().dropItemNaturally(player.getLocation(), leftover);
+            }
+        }
+        debugLog("Dropped leftover bulk trade payout items for " + player.getName());
     }
 
     private void depositToShopOwner(Shopkeeper shopkeeper, double price) {

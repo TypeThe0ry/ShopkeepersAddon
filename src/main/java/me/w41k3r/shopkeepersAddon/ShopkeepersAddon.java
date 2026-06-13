@@ -324,7 +324,7 @@ public final class ShopkeepersAddon extends JavaPlugin {
     }
 
     private void cleanupResources() {
-        // Add any cleanup logic here if needed
+        me.w41k3r.shopkeepersAddon.economy.DailyEarningsManager.shutdown();
         plugin = null;
     }
 

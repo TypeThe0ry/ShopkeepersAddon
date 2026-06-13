@@ -92,6 +92,8 @@ messages:
   buySuccess: "§aYou have bought %item% for %price%."
   sellSuccess: "§aYou have sold %item% for %price%."
   dailyLimitReached: "§cDaily earning limit reached! You can only earn %remaining% more today (Limit: %limit%)."
+  inventoryFull: "§cYou don't have enough inventory space for this trade."
+  error: "§cAn error occurred while processing the transaction."
   setPrice: "§aPlease enter the new price for this item:"
   invalidPrice: "§cInvalid price! Please enter a valid number."
   priceChanged: "§aPrice changed successfully!"

@@ -9,6 +9,7 @@ import java.util.logging.Level;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.scheduler.BukkitTask;
 
 import static me.w41k3r.shopkeepersAddon.ShopkeepersAddon.config;
 import static me.w41k3r.shopkeepersAddon.ShopkeepersAddon.plugin;
@@ -18,10 +19,13 @@ public class DailyEarningsManager {
     private static final String DATE_FORMAT = "yyyy-MM-dd";
     private static final String LAST_RESET_PATH = "last-reset";
     private static final String EARNINGS_PATH = "earnings";
+    private static final long SAVE_INTERVAL_TICKS = 20L * 60L;
 
     private static File dataFile;
     private static FileConfiguration dataConfig;
     private static String lastResetDate;
+    private static boolean dirty;
+    private static BukkitTask saveTask;
 
     public static void initialize() {
         dataFile = new File(plugin.getDataFolder(), "daily_earnings.yml");
@@ -36,6 +40,7 @@ public class DailyEarningsManager {
         dataConfig = YamlConfiguration.loadConfiguration(dataFile);
         lastResetDate = dataConfig.getString(LAST_RESET_PATH, "");
         checkDateReset();
+        startSaveTask();
     }
 
     private static void checkDateReset() {
@@ -45,7 +50,7 @@ public class DailyEarningsManager {
             dataConfig.set(EARNINGS_PATH, null);
             dataConfig.set(LAST_RESET_PATH, today);
             lastResetDate = today;
-            saveData();
+            markDirty();
         }
     }
 
@@ -57,7 +62,7 @@ public class DailyEarningsManager {
     public static void addEarnings(Player player, double amount) {
         checkDateReset();
         dataConfig.set(EARNINGS_PATH + "." + player.getUniqueId(), getEarningsWithoutReset(player) + amount);
-        saveData();
+        markDirty();
     }
 
     private static double getEarningsWithoutReset(Player player) {
@@ -79,10 +84,39 @@ public class DailyEarningsManager {
         return Math.max(0.0D, getDailyLimit() - getEarnings(player));
     }
 
-    private static void saveData() {
+    public static void shutdown() {
+        if (saveTask != null) {
+            saveTask.cancel();
+            saveTask = null;
+        }
+        flushDirtyData();
+    }
+
+    private static void markDirty() {
+        dirty = true;
+    }
+
+    private static void startSaveTask() {
+        if (plugin == null) {
+            return;
+        }
+        if (saveTask != null) {
+            saveTask.cancel();
+        }
+        saveTask = plugin.getServer().getScheduler().runTaskTimer(plugin,
+                DailyEarningsManager::flushDirtyData,
+                SAVE_INTERVAL_TICKS,
+                SAVE_INTERVAL_TICKS);
+    }
+
+    private static void flushDirtyData() {
+        if (!dirty) {
+            return;
+        }
         ensureInitialized();
         try {
             dataConfig.save(dataFile);
+            dirty = false;
         } catch (IOException e) {
             plugin.getLogger().log(Level.SEVERE, "Could not save daily_earnings.yml", e);
         }

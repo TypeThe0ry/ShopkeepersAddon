@@ -62,15 +62,22 @@ public class EconomyListener implements Listener {
 
     private static final int REMOVE_ECONOMY_ITEM_DELAY = 1;
     private static final String BUY_SUCCESS_FALLBACK = "§aYou have bought %item% for %price%.";
+    private static final String SELL_SUCCESS_FALLBACK = "§aYou have sold %item% for %price%.";
     private static final String DAILY_LIMIT_FALLBACK = "§cDaily earning limit reached! You can only earn %remaining% more today (Limit: %limit%).";
     private static final String ERROR_FALLBACK = "§cAn error occurred while processing the transaction.";
     private static final String INVENTORY_FULL_FALLBACK = "§cYou don't have enough inventory space for this trade.";
+    private static final String NO_MONEY_OWNER_FALLBACK = "§cThe shop owner doesn't have enough money!";
 
     private static final String SHOPKEEPERS_DATA_PATH = "Shopkeepers/data/save.yml";
 
     private static final String OWNER_UUID_PATH = ".owner uuid";
+    private static final long OWNER_CACHE_REFRESH_INTERVAL_MILLIS = 5000L;
 
     private static final ConcurrentMap<Class<?>, Optional<Method>> META_GET_AS_STRING_METHODS = new ConcurrentHashMap<>();
+
+    private final Map<String, String> ownerUuidByShopkeeperId = new ConcurrentHashMap<>();
+    private long ownerCacheLastModified = Long.MIN_VALUE;
+    private long nextOwnerCacheRefreshMillis;
 
     private enum TradeProcessResult {
         SUCCESS,
@@ -127,11 +134,7 @@ public class EconomyListener implements Listener {
              if (shopkeeper instanceof PlayerShopkeeper) {
                  double price = getPrice(recipe.getResult());
                  if (getOwnerMoney(shopkeeper) < price) {
-                     
-                     // Show red 'X' lock visual
-                     recipe.setUses(recipe.getMaxUses());
-                     
-                     sendPlayerMessage(player, config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
+                     sendNoMoneyOwner(player, recipe);
                      event.setCancelled(true);
                      return;
                  }
@@ -436,14 +439,9 @@ public class EconomyListener implements Listener {
     }
 
     private void depositToShopOwner(Shopkeeper shopkeeper, double price) {
-        String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
-        if (ownerUUID != null) {
-            String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
-            if (ownerName != null) {
-                EconomyManager.giveMoney(ownerName, price);
-            } else {
-                debugLog("Could not determine owner name for UUID: " + ownerUUID);
-            }
+        String ownerName = getShopkeeperOwnerName(shopkeeper);
+        if (ownerName != null) {
+            EconomyManager.giveMoney(ownerName, price);
         } else {
             debugLog("Could not find owner UUID for shopkeeper: " + shopkeeper.getId());
         }
@@ -480,6 +478,8 @@ public class EconomyListener implements Listener {
                         .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
                         .replace("%remaining%", formatPrice(remaining)));
                 recipe.setUses(recipe.getMaxUses());
+            } else if (!isAdminShopkeeper && getOwnerMoney(shopkeeper) < pricePerTrade) {
+                sendNoMoneyOwner(player, recipe);
             }
             event.setCancelled(true);
             return;
@@ -509,7 +509,7 @@ public class EconomyListener implements Listener {
             return;
         }
 
-        sendPlayerMessage(player, config.getString("messages.sellSuccess", "You have sold %item% for %price%.")
+        sendPlayerMessage(player, config.getString("messages.sellSuccess", SELL_SUCCESS_FALLBACK)
                 .replace("%item%", getItemDisplayNameSafe(sellIngredients.isEmpty() ? null : sellIngredients.get(0)))
                 .replace("%price%", formatPrice(totalPrice)));
     }
@@ -543,23 +543,14 @@ public class EconomyListener implements Listener {
                 return TradeProcessResult.HANDLED_FAILURE;
             }
         } else if (!isAdminShopkeeper && getOwnerMoney(shopkeeper) < pricePerTrade) {
-            if (merchantRecipe != null) {
-                merchantRecipe.setUses(merchantRecipe.getMaxUses());
-            }
-            sendPlayerMessage(player,
-                    config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
+            sendNoMoneyOwner(player, merchantRecipe);
             return TradeProcessResult.HANDLED_FAILURE;
         }
 
         String ownerName = null;
         if (!isAdminShopkeeper) {
-            String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
-            if (ownerUUID == null) {
-                return TradeProcessResult.UNRECOVERABLE_FAILURE;
-            }
-            ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
+            ownerName = getShopkeeperOwnerName(shopkeeper);
             if (ownerName == null) {
-                debugLog("Could not determine owner name for UUID: " + ownerUUID);
                 return TradeProcessResult.UNRECOVERABLE_FAILURE;
             }
         }
@@ -579,7 +570,7 @@ public class EconomyListener implements Listener {
             depositIngredientsToContainer(shopkeeper, sellIngredients, 1);
         }
 
-        sendPlayerMessage(player, config.getString("messages.sellSuccess", "You have sold %item% for %price%.")
+        sendPlayerMessage(player, config.getString("messages.sellSuccess", SELL_SUCCESS_FALLBACK)
                 .replace("%item%", getItemDisplayNameSafe(sellIngredients.isEmpty() ? null : sellIngredients.get(0)))
                 .replace("%price%", formatPrice(pricePerTrade)));
         return TradeProcessResult.SUCCESS;
@@ -638,43 +629,7 @@ public class EconomyListener implements Listener {
 
     private List<ItemStack> getSellIngredients(InventoryClickEvent event, MerchantRecipe merchantRecipe,
             TradingRecipe tradingRecipe) {
-        List<ItemStack> ingredients = new ArrayList<>();
-
-        if (tradingRecipe != null) {
-            addSellIngredient(ingredients, tradingRecipe.getItem1().copy());
-            if (tradingRecipe.hasItem2()) {
-                addSellIngredient(ingredients, tradingRecipe.getItem2().copy());
-            }
-            if (!ingredients.isEmpty()) {
-                return ingredients;
-            }
-        }
-
-        if (merchantRecipe != null && merchantRecipe.getIngredients() != null) {
-            for (ItemStack ingredient : merchantRecipe.getIngredients()) {
-                addSellIngredient(ingredients, ingredient);
-            }
-            if (!ingredients.isEmpty()) {
-                return ingredients;
-            }
-            for (ItemStack ingredient : merchantRecipe.getIngredients()) {
-                if (!isEmpty(ingredient)) {
-                    ingredients.add(ingredient.clone());
-                }
-            }
-            if (!ingredients.isEmpty()) {
-                return ingredients;
-            }
-        }
-
-        Inventory inventory = getMerchantInventory(event);
-        if (inventory instanceof MerchantInventory merchantInventory) {
-            for (int slot = 0; slot <= 1; slot++) {
-                addSellIngredient(ingredients, merchantInventory.getItem(slot));
-            }
-        }
-
-        return ingredients;
+        return getSellIngredients(getMerchantInventory(event), merchantRecipe, tradingRecipe);
     }
 
     private List<ItemStack> getSellIngredients(Inventory merchantInventory, MerchantRecipe merchantRecipe,
@@ -1339,15 +1294,16 @@ public class EconomyListener implements Listener {
     }
 
     private double getOwnerMoney(Shopkeeper shopkeeper) {
-        String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
-        if (ownerUUID == null) return 0;
-        
-        String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
-        if (ownerName == null) {
-            debugLog("Could not determine owner name for UUID: " + ownerUUID);
-            return 0;
-        }
+        String ownerName = getShopkeeperOwnerName(shopkeeper);
+        if (ownerName == null) return 0;
         return EconomyManager.getBalance(ownerName);
+    }
+
+    private void sendNoMoneyOwner(Player player, MerchantRecipe recipe) {
+        if (recipe != null) {
+            recipe.setUses(recipe.getMaxUses());
+        }
+        sendPlayerMessage(player, config.getString("messages.noMoneyOwner", NO_MONEY_OWNER_FALLBACK));
     }
 
     private boolean handleAdminTrade(InventoryClickEvent event, List<ItemStack> sellIngredients, Player player,
@@ -1370,20 +1326,12 @@ public class EconomyListener implements Listener {
 
         double ownerMoney = getOwnerMoney(shopkeeper);
         if (ownerMoney < totalPrice) {
-            recipe.setUses(recipe.getMaxUses());
-            sendPlayerMessage(player,
-                    config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
+            sendNoMoneyOwner(player, recipe);
             return false;
         }
 
-        String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
-        if (ownerUUID == null) {
-            return false;
-        }
-
-        String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
+        String ownerName = getShopkeeperOwnerName(shopkeeper);
         if (ownerName == null) {
-            debugLog("Could not determine owner name for UUID: " + ownerUUID);
             sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
             return false;
         }
@@ -1397,20 +1345,62 @@ public class EconomyListener implements Listener {
         depositIngredientsToContainer(shopkeeper, sellIngredients, maxTrades);
         return true;
     }
-    /**
-     * Centralized helper to get owner UUID from shopkeeper data file.
-     * Used by getOwnerMoney(), depositToShopOwner(), and handlePlayerShopTrade().
-     */
+
     private String getShopkeeperOwnerUUID(Shopkeeper shopkeeper) {
+        if (shopkeeper == null) {
+            return null;
+        }
+        String shopkeeperId = String.valueOf(shopkeeper.getId());
         try {
-            String shopkeeperId = String.valueOf(shopkeeper.getId());
-            File dataFile = new File(plugin.getDataFolder().getParentFile(), SHOPKEEPERS_DATA_PATH);
-            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-            return dataConfig.getString(shopkeeperId + OWNER_UUID_PATH);
+            refreshOwnerUuidCache();
+            return ownerUuidByShopkeeperId.get(shopkeeperId);
         } catch (Exception e) {
             Bukkit.getLogger().log(Level.SEVERE, "Failed to get owner UUID for shopkeeper: " + shopkeeper.getId(), e);
             return null;
         }
+    }
+
+    private String getShopkeeperOwnerName(Shopkeeper shopkeeper) {
+        String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
+        if (ownerUUID == null) {
+            return null;
+        }
+        try {
+            String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
+            if (ownerName == null) {
+                debugLog("Could not determine owner name for UUID: " + ownerUUID);
+            }
+            return ownerName;
+        } catch (IllegalArgumentException e) {
+            debugLog("Invalid owner UUID for shopkeeper " + shopkeeper.getId() + ": " + ownerUUID);
+            return null;
+        }
+    }
+
+    private void refreshOwnerUuidCache() {
+        long now = System.currentTimeMillis();
+        if (now < nextOwnerCacheRefreshMillis) {
+            return;
+        }
+        nextOwnerCacheRefreshMillis = now + OWNER_CACHE_REFRESH_INTERVAL_MILLIS;
+
+        File dataFile = new File(plugin.getDataFolder().getParentFile(), SHOPKEEPERS_DATA_PATH);
+        long lastModified = dataFile.lastModified();
+        if (lastModified == ownerCacheLastModified) {
+            return;
+        }
+
+        YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+        Map<String, String> refreshedOwnerUuids = new ConcurrentHashMap<>();
+        for (String shopkeeperId : dataConfig.getKeys(false)) {
+            String ownerUUID = dataConfig.getString(shopkeeperId + OWNER_UUID_PATH);
+            if (ownerUUID != null) {
+                refreshedOwnerUuids.put(shopkeeperId, ownerUUID);
+            }
+        }
+        ownerUuidByShopkeeperId.clear();
+        ownerUuidByShopkeeperId.putAll(refreshedOwnerUuids);
+        ownerCacheLastModified = lastModified;
     }
 
     /**

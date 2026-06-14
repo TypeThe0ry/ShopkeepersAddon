@@ -3,6 +3,7 @@ package me.w41k3r.shopkeepersAddon.economy.events;
 import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -411,7 +412,7 @@ public class EconomyListener implements Listener {
             if (isAdminShopkeeper && DailyEarningsManager.isLimitEnabled()
                     && DailyEarningsManager.getRemainingLimit(player) < pricePerTrade) {
                 double remaining = DailyEarningsManager.getRemainingLimit(player);
-                sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "You have reached your daily earning limit of %limit%!")
+                sendPlayerMessage(player, config.getString("messages.dailyLimitReached", DAILY_LIMIT_FALLBACK)
                         .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
                         .replace("%remaining%", formatPrice(remaining)));
                 recipe.setUses(recipe.getMaxUses());
@@ -427,7 +428,7 @@ public class EconomyListener implements Listener {
             if (DailyEarningsManager.isLimitEnabled()) {
                 double remaining = DailyEarningsManager.getRemainingLimit(player);
                 if (remaining < pricePerTrade) {
-                    sendPlayerMessage(player, config.getString("messages.dailyLimitReached", "You have reached your daily earning limit of %limit%!")
+                    sendPlayerMessage(player, config.getString("messages.dailyLimitReached", DAILY_LIMIT_FALLBACK)
                             .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
                             .replace("%remaining%", formatPrice(remaining)));
                     event.setCancelled(true);
@@ -482,10 +483,11 @@ public class EconomyListener implements Listener {
     private int calculateMaxTradesByIngredients(InventoryClickEvent event, List<ItemStack> ingredients,
             boolean includePlayerInventory) {
         int maxTrades = Integer.MAX_VALUE;
+        MatchCache matchCache = new MatchCache();
 
         for (ItemStack ingredient : aggregateIngredients(ingredients, 1)) {
             int required = ingredient.getAmount();
-            int available = countAvailableIngredients(event, ingredient, includePlayerInventory);
+            int available = countAvailableIngredients(event, ingredient, includePlayerInventory, matchCache);
             maxTrades = Math.min(maxTrades, available / required);
         }
 
@@ -526,7 +528,7 @@ public class EconomyListener implements Listener {
         Inventory inventory = getMerchantInventory(event);
         if (inventory instanceof MerchantInventory merchantInventory) {
             for (int slot = 0; slot <= 1; slot++) {
-                addSellInputIngredient(ingredients, merchantInventory.getItem(slot));
+                addSellIngredient(ingredients, merchantInventory.getItem(slot));
             }
         }
 
@@ -534,12 +536,6 @@ public class EconomyListener implements Listener {
     }
 
     private void addSellIngredient(List<ItemStack> ingredients, ItemStack item) {
-        if (!isEmpty(item) && !isEconomyItem(item)) {
-            ingredients.add(item.clone());
-        }
-    }
-
-    private void addSellInputIngredient(List<ItemStack> ingredients, ItemStack item) {
         if (!isEmpty(item) && !isEconomyItem(item)) {
             ingredients.add(item.clone());
         }
@@ -564,6 +560,7 @@ public class EconomyListener implements Listener {
 
         Inventory playerInventory = getPlayerInventory(event);
         Inventory merchantInventory = getMerchantInventory(event);
+        MatchCache matchCache = new MatchCache();
         if (ingredients == null || ingredients.isEmpty()) {
             return false;
         }
@@ -571,7 +568,7 @@ public class EconomyListener implements Listener {
         List<ItemStack> requiredIngredients = aggregateIngredients(ingredients, tradeCount);
         for (ItemStack ingredient : requiredIngredients) {
             int required = ingredient.getAmount();
-            int available = countAvailableIngredients(event, ingredient, includePlayerInventory);
+            int available = countAvailableIngredients(event, ingredient, includePlayerInventory, matchCache);
             if (available < required) {
                 return false;
             }
@@ -582,17 +579,17 @@ public class EconomyListener implements Listener {
         List<Integer> expectedRemaining = new ArrayList<>();
         for (ItemStack ingredient : requiredIngredients) {
             int required = ingredient.getAmount();
-            int removedFromMerchant = removeMatchingInput(merchantInventory, ingredient, required);
+            int removedFromMerchant = removeMatchingInput(merchantInventory, ingredient, required, matchCache);
             int remaining = required - removedFromMerchant;
             int removedFromPlayer = includePlayerInventory && remaining > 0
-                    ? removeMatching(playerInventory, ingredient, remaining)
+                    ? removeMatching(playerInventory, ingredient, remaining, matchCache)
                     : 0;
             if (removedFromPlayer + removedFromMerchant != required) {
                 return false;
             }
             consumedAny = true;
             cleanupTargets.add(ingredient.clone());
-            expectedRemaining.add(countMatchingInput(merchantInventory, ingredient));
+            expectedRemaining.add(countMatchingInput(merchantInventory, ingredient, matchCache));
         }
         scheduleIngredientCleanup(merchantInventory, cleanupTargets, expectedRemaining);
         return consumedAny;
@@ -600,6 +597,7 @@ public class EconomyListener implements Listener {
 
     private List<ItemStack> aggregateIngredients(List<ItemStack> ingredients, int multiplier) {
         List<ItemStack> aggregated = new ArrayList<>();
+        MatchCache matchCache = new MatchCache();
         if (ingredients == null || multiplier <= 0) {
             return aggregated;
         }
@@ -611,7 +609,7 @@ public class EconomyListener implements Listener {
 
             ItemStack required = ingredient.clone();
             required.setAmount(ingredient.getAmount() * multiplier);
-            ItemStack existing = findMatchingIngredient(aggregated, required);
+            ItemStack existing = findMatchingIngredient(aggregated, required, matchCache);
             if (existing == null) {
                 aggregated.add(required);
             } else {
@@ -621,9 +619,9 @@ public class EconomyListener implements Listener {
         return aggregated;
     }
 
-    private ItemStack findMatchingIngredient(List<ItemStack> ingredients, ItemStack target) {
+    private ItemStack findMatchingIngredient(List<ItemStack> ingredients, ItemStack target, MatchCache matchCache) {
         for (ItemStack ingredient : ingredients) {
-            if (matches(ingredient, target) && matches(target, ingredient)) {
+            if (matches(ingredient, target, matchCache) && matches(target, ingredient, matchCache)) {
                 return ingredient;
             }
         }
@@ -636,8 +634,9 @@ public class EconomyListener implements Listener {
             return true;
         }
         Inventory merchantInventory = getMerchantInventory(event);
+        MatchCache matchCache = new MatchCache();
         int required = ingredient.getAmount() * tradeCount;
-        int before = countMatchingInput(merchantInventory, ingredient);
+        int before = countMatchingInput(merchantInventory, ingredient, matchCache);
         if (before < required) {
             return false;
         }
@@ -655,8 +654,10 @@ public class EconomyListener implements Listener {
         if (ingredient == null) {
             return requestedTradeCount;
         }
+        MatchCache matchCache = new MatchCache();
         int requiredPerTrade = ingredient.getAmount();
-        int available = countMatching(getPlayerInventory(event), ingredient) + countMatchingInput(getMerchantInventory(event), ingredient);
+        int available = countMatching(getPlayerInventory(event), ingredient, matchCache)
+                + countMatchingInput(getMerchantInventory(event), ingredient, matchCache);
         return Math.min(requestedTradeCount, available / requiredPerTrade);
     }
 
@@ -668,13 +669,15 @@ public class EconomyListener implements Listener {
         int required = ingredient.getAmount() * tradeCount;
         Inventory playerInventory = getPlayerInventory(event);
         Inventory merchantInventory = getMerchantInventory(event);
-        if (countMatching(playerInventory, ingredient) + countMatchingInput(merchantInventory, ingredient) < required) {
+        MatchCache matchCache = new MatchCache();
+        if (countMatching(playerInventory, ingredient, matchCache)
+                + countMatchingInput(merchantInventory, ingredient, matchCache) < required) {
             return false;
         }
-        int removedFromPlayer = removeMatching(playerInventory, ingredient, required);
+        int removedFromPlayer = removeMatching(playerInventory, ingredient, required, matchCache);
         int remaining = required - removedFromPlayer;
         if (remaining > 0) {
-            removeMatchingInput(merchantInventory, ingredient, remaining);
+            removeMatchingInput(merchantInventory, ingredient, remaining, matchCache);
         }
         return true;
     }
@@ -700,12 +703,16 @@ public class EconomyListener implements Listener {
     }
 
     private int countMatching(Inventory inventory, ItemStack target) {
+        return countMatching(inventory, target, new MatchCache());
+    }
+
+    private int countMatching(Inventory inventory, ItemStack target, MatchCache matchCache) {
         if (inventory == null || isEmpty(target)) {
             return 0;
         }
         int count = 0;
         for (ItemStack item : inventory.getContents()) {
-            if (matches(item, target)) {
+            if (matches(item, target, matchCache)) {
                 count += item.getAmount();
             }
         }
@@ -713,13 +720,17 @@ public class EconomyListener implements Listener {
     }
 
     private int countMatchingInput(Inventory inventory, ItemStack target) {
+        return countMatchingInput(inventory, target, new MatchCache());
+    }
+
+    private int countMatchingInput(Inventory inventory, ItemStack target, MatchCache matchCache) {
         if (!(inventory instanceof MerchantInventory merchantInventory) || isEmpty(target)) {
             return 0;
         }
         int count = 0;
         for (int slot = 0; slot <= 1; slot++) {
             ItemStack item = merchantInventory.getItem(slot);
-            if (matches(item, target)) {
+            if (matches(item, target, matchCache)) {
                 count += item.getAmount();
             }
         }
@@ -727,10 +738,10 @@ public class EconomyListener implements Listener {
     }
 
     private int countAvailableIngredients(InventoryClickEvent event, ItemStack target,
-            boolean includePlayerInventory) {
-        int available = countMatchingInput(getMerchantInventory(event), target);
+            boolean includePlayerInventory, MatchCache matchCache) {
+        int available = countMatchingInput(getMerchantInventory(event), target, matchCache);
         if (includePlayerInventory) {
-            available += countMatching(getPlayerInventory(event), target);
+            available += countMatching(getPlayerInventory(event), target, matchCache);
         }
         return available;
     }
@@ -741,12 +752,13 @@ public class EconomyListener implements Listener {
             return;
         }
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            MatchCache matchCache = new MatchCache();
             for (int index = 0; index < targets.size(); index++) {
                 ItemStack target = targets.get(index);
                 int expected = expectedRemaining.get(index);
-                int current = countMatchingInput(merchantInventory, target);
+                int current = countMatchingInput(merchantInventory, target, matchCache);
                 if (current > expected) {
-                    removeMatchingInput(merchantInventory, target, current - expected);
+                    removeMatchingInput(merchantInventory, target, current - expected, matchCache);
                 }
             }
             if (merchantInventory instanceof MerchantInventory merchant
@@ -757,6 +769,10 @@ public class EconomyListener implements Listener {
     }
 
     private int removeMatching(Inventory inventory, ItemStack target, int amount) {
+        return removeMatching(inventory, target, amount, new MatchCache());
+    }
+
+    private int removeMatching(Inventory inventory, ItemStack target, int amount, MatchCache matchCache) {
         if (inventory == null || amount <= 0) {
             return 0;
         }
@@ -764,7 +780,7 @@ public class EconomyListener implements Listener {
         ItemStack[] contents = inventory.getContents();
         for (int slot = 0; slot < contents.length && remaining > 0; slot++) {
             ItemStack item = contents[slot];
-            if (!matches(item, target)) {
+            if (!matches(item, target, matchCache)) {
                 continue;
             }
             int take = Math.min(item.getAmount(), remaining);
@@ -781,13 +797,17 @@ public class EconomyListener implements Listener {
     }
 
     private int removeMatchingInput(Inventory inventory, ItemStack target, int amount) {
+        return removeMatchingInput(inventory, target, amount, new MatchCache());
+    }
+
+    private int removeMatchingInput(Inventory inventory, ItemStack target, int amount, MatchCache matchCache) {
         if (!(inventory instanceof MerchantInventory merchantInventory) || amount <= 0) {
             return 0;
         }
         int remaining = amount;
         for (int slot = 0; slot <= 1 && remaining > 0; slot++) {
             ItemStack item = merchantInventory.getItem(slot);
-            if (!matches(item, target)) {
+            if (!matches(item, target, matchCache)) {
                 continue;
             }
             int take = Math.min(item.getAmount(), remaining);
@@ -804,38 +824,62 @@ public class EconomyListener implements Listener {
     }
 
     private boolean matches(ItemStack item, ItemStack target) {
+        return matches(item, target, new MatchCache());
+    }
+
+    private boolean matches(ItemStack item, ItemStack target, MatchCache matchCache) {
         if (isEmpty(item) || isEmpty(target) || item.getType() != target.getType()) {
             return false;
         }
         if (item.isSimilar(target)) {
             return true;
         }
-        String targetCraftEngineId = getMetaValue(target, "craftengine:id");
-        if (targetCraftEngineId != null && targetCraftEngineId.equals(getMetaValue(item, "craftengine:id"))) {
+        MatchProfile itemProfile = matchCache.get(item);
+        MatchProfile targetProfile = matchCache.get(target);
+        if (targetProfile.craftEngineId != null
+                && targetProfile.craftEngineId.equals(itemProfile.craftEngineId)) {
             return true;
         }
-        String targetItemModel = getMetaValue(target, "minecraft:item_model");
-        if (targetItemModel == null) {
-            targetItemModel = getMetaValue(target, "item_model");
-        }
-        String itemModel = getMetaValue(item, "minecraft:item_model");
-        if (itemModel == null) {
-            itemModel = getMetaValue(item, "item_model");
-        }
-        if (targetItemModel != null && targetItemModel.equals(itemModel)
-                && sameCustomModelData(item, target)) {
+        if (targetProfile.itemModel != null && targetProfile.itemModel.equals(itemProfile.itemModel)
+                && sameCustomModelData(itemProfile, targetProfile)) {
             return true;
         }
-        return sameCustomModelData(item, target);
+        return sameCustomModelData(itemProfile, targetProfile);
     }
 
-    private boolean sameCustomModelData(ItemStack item, ItemStack target) {
-        String itemValue = getCustomModelDataValue(item);
-        String targetValue = getCustomModelDataValue(target);
-        return targetValue != null && targetValue.equals(itemValue);
+    private boolean sameCustomModelData(MatchProfile item, MatchProfile target) {
+        return target.customModelData != null && target.customModelData.equals(item.customModelData);
     }
 
-    private String getCustomModelDataValue(ItemStack item) {
+    private MatchProfile createMatchProfile(ItemStack item) {
+        String metaString = getMetaString(item);
+        return new MatchProfile(
+                getMetaValue(metaString, "craftengine:id"),
+                getFirstMetaValue(metaString, "minecraft:item_model", "item_model"),
+                getCustomModelDataValue(item, metaString));
+    }
+
+    private final class MatchCache {
+        private final Map<ItemStack, MatchProfile> profiles = new IdentityHashMap<>();
+
+        private MatchProfile get(ItemStack item) {
+            return profiles.computeIfAbsent(item, EconomyListener.this::createMatchProfile);
+        }
+    }
+
+    private static final class MatchProfile {
+        private final String craftEngineId;
+        private final String itemModel;
+        private final String customModelData;
+
+        private MatchProfile(String craftEngineId, String itemModel, String customModelData) {
+            this.craftEngineId = craftEngineId;
+            this.itemModel = itemModel;
+            this.customModelData = customModelData;
+        }
+    }
+
+    private String getCustomModelDataValue(ItemStack item, String metaString) {
         if (item == null) {
             return null;
         }
@@ -849,7 +893,6 @@ public class EconomyListener implements Listener {
             }
         } catch (Throwable ignored) {
         }
-        String metaString = getMetaString(item);
         if (metaString == null) {
             return null;
         }
@@ -857,12 +900,12 @@ public class EconomyListener implements Listener {
         if (value != null) {
             return normalizeCustomModelData(value);
         }
-        value = getMetaValue(item, "minecraft:custom_model_data");
+        value = getMetaValue(metaString, "minecraft:custom_model_data");
         if (value == null) {
-            value = getMetaValue(item, "custom-model-data");
+            value = getMetaValue(metaString, "custom-model-data");
         }
         if (value == null) {
-            value = getMetaValue(item, "custom_model_data");
+            value = getMetaValue(metaString, "custom_model_data");
         }
         return normalizeCustomModelData(value);
     }
@@ -914,12 +957,21 @@ public class EconomyListener implements Listener {
         return item == null || item.getType() == Material.AIR || item.getAmount() <= 0;
     }
 
-    private String getMetaValue(ItemStack item, String key) {
-        String meta = getMetaString(item);
+    private String getMetaValue(String meta, String key) {
+        return meta == null ? null : extractMetaValue(meta, key);
+    }
+
+    private String getFirstMetaValue(String meta, String... keys) {
         if (meta == null) {
             return null;
         }
-        return extractMetaValue(meta, key);
+        for (String key : keys) {
+            String value = getMetaValue(meta, key);
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private String getMetaString(ItemStack item) {

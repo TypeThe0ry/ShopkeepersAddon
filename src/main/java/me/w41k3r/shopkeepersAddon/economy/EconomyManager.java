@@ -4,10 +4,12 @@ import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemFlag;
@@ -276,7 +278,16 @@ public class EconomyManager {
             return 0.0;
         }
         
-        org.bukkit.OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+        return me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().getBalance(player);
+    }
+
+    public static double getBalance(UUID playerId) {
+        if (me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy() == null) {
+            return 0.0;
+        }
+
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerId);
         return me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().getBalance(player);
     }
 
@@ -291,9 +302,19 @@ public class EconomyManager {
             return;
         }
 
-        org.bukkit.OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
         me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().depositPlayer(player, amount);
         debugLog("Deposited " + formatPrice(amount) + " into " + playerName + "'s account (Vault)");
+    }
+
+    public static void giveMoney(UUID playerId, double amount) {
+        if (me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy() == null) {
+            return;
+        }
+
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerId);
+        me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().depositPlayer(player, amount);
+        debugLog("Deposited " + formatPrice(amount) + " into " + playerId + "'s account (Vault)");
     }
 
     /**
@@ -307,9 +328,19 @@ public class EconomyManager {
             return;
         }
 
-        org.bukkit.OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
         me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().withdrawPlayer(player, amount);
         debugLog("Withdrew " + formatPrice(amount) + " from " + playerName + "'s account (Vault)");
+    }
+
+    public static void takeMoney(UUID playerId, double amount) {
+        if (me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy() == null) {
+            return;
+        }
+
+        OfflinePlayer player = Bukkit.getOfflinePlayer(playerId);
+        me.w41k3r.shopkeepersAddon.ShopkeepersAddon.getEconomy().withdrawPlayer(player, amount);
+        debugLog("Withdrew " + formatPrice(amount) + " from " + playerId + "'s account (Vault)");
     }
 
     /**

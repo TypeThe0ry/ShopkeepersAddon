@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -18,7 +19,6 @@ import java.util.logging.Level;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
-import org.bukkit.block.Chest;
 import org.bukkit.block.Container;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
@@ -74,7 +74,7 @@ public class EconomyListener implements Listener {
     private static final String SHOPKEEPERS_DATA_PATH = "Shopkeepers/data/save.yml";
 
     private static final String OWNER_UUID_PATH = ".owner uuid";
-    private static final long OWNER_CACHE_REFRESH_INTERVAL_MILLIS = 5000L;
+    private static final long OWNER_CACHE_REFRESH_INTERVAL_TICKS = 20L * 5L;
 
     private static final ConcurrentMap<Class<?>, Optional<Method>> META_GET_AS_STRING_METHODS = new ConcurrentHashMap<>();
 
@@ -90,7 +90,7 @@ public class EconomyListener implements Listener {
 
     public EconomyListener() {
         Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::refreshOwnerUuidCache,
-                0L, OWNER_CACHE_REFRESH_INTERVAL_MILLIS / 50L);
+                0L, OWNER_CACHE_REFRESH_INTERVAL_TICKS);
     }
 
     @EventHandler
@@ -497,6 +497,17 @@ public class EconomyListener implements Listener {
         return items;
     }
 
+    private List<ItemStack> createStackedItems(List<ItemStack> items, int multiplier) {
+        List<ItemStack> stackedItems = new ArrayList<>();
+        if (items == null || multiplier <= 0) {
+            return stackedItems;
+        }
+        for (ItemStack item : items) {
+            stackedItems.addAll(createStackedItems(item, multiplier));
+        }
+        return stackedItems;
+    }
+
     private void addItemsOrDrop(Player player, List<ItemStack> items) {
         for (ItemStack item : items) {
             Map<Integer, ItemStack> leftovers = player.getInventory().addItem(item);
@@ -563,12 +574,17 @@ public class EconomyListener implements Listener {
     }
 
     private void depositToShopOwner(Shopkeeper shopkeeper, double price) {
-        String ownerName = getShopkeeperOwnerName(shopkeeper);
-        if (ownerName != null) {
-            EconomyManager.giveMoney(ownerName, price);
+        UUID ownerId = getShopkeeperOwnerId(shopkeeper);
+        if (ownerId != null) {
+            EconomyManager.giveMoney(ownerId, price);
         } else {
             debugLog("Could not find owner UUID for shopkeeper: " + shopkeeper.getId());
         }
+    }
+
+    private boolean canDepositIngredientsToContainer(Shopkeeper shopkeeper, List<ItemStack> ingredients, int multiplier) {
+        Inventory container = getPlayerShopStockInventory(shopkeeper);
+        return container != null && canFitItems(container, createStackedItems(ingredients, multiplier));
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
@@ -671,11 +687,15 @@ public class EconomyListener implements Listener {
             return TradeProcessResult.HANDLED_FAILURE;
         }
 
-        String ownerName = null;
+        UUID ownerId = null;
         if (!isAdminShopkeeper) {
-            ownerName = getShopkeeperOwnerName(shopkeeper);
-            if (ownerName == null) {
+            ownerId = getShopkeeperOwnerId(shopkeeper);
+            if (ownerId == null) {
                 return TradeProcessResult.UNRECOVERABLE_FAILURE;
+            }
+            if (!canDepositIngredientsToContainer(shopkeeper, sellIngredients, 1)) {
+                sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
+                return TradeProcessResult.HANDLED_FAILURE;
             }
         }
 
@@ -689,9 +709,12 @@ public class EconomyListener implements Listener {
                 DailyEarningsManager.addEarnings(player, pricePerTrade);
             }
         } else {
-            EconomyManager.takeMoney(ownerName, pricePerTrade);
+            if (!depositIngredientsToContainer(shopkeeper, sellIngredients, 1)) {
+                addItemsOrDrop(player, createStackedItems(sellIngredients, 1));
+                return TradeProcessResult.UNRECOVERABLE_FAILURE;
+            }
+            EconomyManager.takeMoney(ownerId, pricePerTrade);
             EconomyManager.giveMoney(player.getName(), pricePerTrade);
-            depositIngredientsToContainer(shopkeeper, sellIngredients, 1);
         }
 
         sendPlayerMessage(player, config.getString("messages.sellSuccess", SELL_SUCCESS_FALLBACK)
@@ -1430,9 +1453,9 @@ public class EconomyListener implements Listener {
     }
 
     private double getOwnerMoney(Shopkeeper shopkeeper) {
-        String ownerName = getShopkeeperOwnerName(shopkeeper);
-        if (ownerName == null) return 0;
-        return EconomyManager.getBalance(ownerName);
+        UUID ownerId = getShopkeeperOwnerId(shopkeeper);
+        if (ownerId == null) return 0;
+        return EconomyManager.getBalance(ownerId);
     }
 
     private void sendNoMoneyOwner(Player player, MerchantRecipe recipe) {
@@ -1466,8 +1489,12 @@ public class EconomyListener implements Listener {
             return false;
         }
 
-        String ownerName = getShopkeeperOwnerName(shopkeeper);
-        if (ownerName == null) {
+        UUID ownerId = getShopkeeperOwnerId(shopkeeper);
+        if (ownerId == null) {
+            sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
+            return false;
+        }
+        if (!canDepositIngredientsToContainer(shopkeeper, sellIngredients, maxTrades)) {
             sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
             return false;
         }
@@ -1476,9 +1503,12 @@ public class EconomyListener implements Listener {
             return false;
         }
 
-        EconomyManager.takeMoney(ownerName, totalPrice);
+        if (!depositIngredientsToContainer(shopkeeper, sellIngredients, maxTrades)) {
+            addItemsOrDrop(player, createStackedItems(sellIngredients, maxTrades));
+            return false;
+        }
+        EconomyManager.takeMoney(ownerId, totalPrice);
         EconomyManager.giveMoney(player.getName(), totalPrice);
-        depositIngredientsToContainer(shopkeeper, sellIngredients, maxTrades);
         return true;
     }
 
@@ -1495,17 +1525,13 @@ public class EconomyListener implements Listener {
         }
     }
 
-    private String getShopkeeperOwnerName(Shopkeeper shopkeeper) {
+    private UUID getShopkeeperOwnerId(Shopkeeper shopkeeper) {
         String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
         if (ownerUUID == null) {
             return null;
         }
         try {
-            String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
-            if (ownerName == null) {
-                debugLog("Could not determine owner name for UUID: " + ownerUUID);
-            }
-            return ownerName;
+            return UUID.fromString(ownerUUID);
         } catch (IllegalArgumentException e) {
             debugLog("Invalid owner UUID for shopkeeper " + shopkeeper.getId() + ": " + ownerUUID);
             return null;
@@ -1561,24 +1587,59 @@ public class EconomyListener implements Listener {
         return displayName.isEmpty() ? item.getType().name() : displayName;
     }
 
-    private void depositIngredientsToContainer(Shopkeeper shopkeeper, List<ItemStack> ingredients, int multiplier) {
+    private boolean depositIngredientsToContainer(Shopkeeper shopkeeper, List<ItemStack> ingredients, int multiplier) {
         if (!(shopkeeper instanceof PlayerShopkeeper playerShopkeeper))
-            return;
+            return false;
 
+        Inventory container = null;
+        List<ItemStack> depositedItems = new ArrayList<>();
         try {
-            Inventory container = ((Chest) playerShopkeeper.getContainer().getState()).getBlockInventory();
+            if (!(playerShopkeeper.getContainer().getState() instanceof Container containerState)) {
+                return false;
+            }
+            container = containerState.getInventory();
 
             for (ItemStack ingredient : ingredients) {
                 if (ingredient == null || ingredient.getType() == Material.AIR)
                     continue;
 
                 for (ItemStack toAdd : createStackedItems(ingredient, multiplier)) {
-                    container.addItem(toAdd);
+                    Map<Integer, ItemStack> leftovers = container.addItem(toAdd);
+                    if (!leftovers.isEmpty()) {
+                        int depositedAmount = toAdd.getAmount() - countItemAmounts(leftovers.values());
+                        if (depositedAmount > 0) {
+                            ItemStack depositedItem = toAdd.clone();
+                            depositedItem.setAmount(depositedAmount);
+                            depositedItems.add(depositedItem);
+                        }
+                        removeStockItems(container, depositedItems);
+                        debugLog("Could not fully deposit sold ingredients to shop container.");
+                        return false;
+                    }
+                    depositedItems.add(toAdd.clone());
                 }
             }
+            return true;
         } catch (Exception e) {
+            if (container != null && !depositedItems.isEmpty()) {
+                removeStockItems(container, depositedItems);
+            }
             Bukkit.getLogger().log(Level.SEVERE, "Failed to deposit ingredients to shop container", e);
+            return false;
         }
+    }
+
+    private int countItemAmounts(Iterable<ItemStack> items) {
+        int amount = 0;
+        if (items == null) {
+            return amount;
+        }
+        for (ItemStack item : items) {
+            if (!isEmpty(item)) {
+                amount = addAmountsCapped(amount, item.getAmount());
+            }
+        }
+        return amount;
     }
 
     private void handleEconomyItemClick(InventoryClickEvent event) {

@@ -2,6 +2,8 @@ package me.w41k3r.shopkeepersAddon.economy;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.logging.Level;
@@ -20,6 +22,9 @@ public class DailyEarningsManager {
     private static final String EARNINGS_PATH = "earnings";
     private static final long SAVE_INTERVAL_TICKS = 20L * 60L;
 
+    private static final Object DATA_LOCK = new Object();
+    private static final Object SAVE_LOCK = new Object();
+
     private static File dataFile;
     private static FileConfiguration dataConfig;
     private static String lastResetDate;
@@ -37,14 +42,22 @@ public class DailyEarningsManager {
             }
         }
 
-        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-        lastResetDate = dataConfig.getString(LAST_RESET_PATH, "");
+        synchronized (DATA_LOCK) {
+            dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            lastResetDate = dataConfig.getString(LAST_RESET_PATH, "");
+        }
         checkDateReset();
         startSaveTask();
     }
 
     private static void checkDateReset() {
-        ensureInitialized();
+        synchronized (DATA_LOCK) {
+            checkDateResetLocked();
+        }
+    }
+
+    private static void checkDateResetLocked() {
+        ensureInitializedLocked();
         long now = System.currentTimeMillis();
         if (now < nextDateCheckMillis) {
             return;
@@ -60,22 +73,26 @@ public class DailyEarningsManager {
             dataConfig.set(EARNINGS_PATH, null);
             dataConfig.set(LAST_RESET_PATH, today);
             lastResetDate = today;
-            markDirty();
+            markDirtyLocked();
         }
     }
 
     public static double getEarnings(Player player) {
-        checkDateReset();
-        return getEarningsWithoutReset(player);
+        synchronized (DATA_LOCK) {
+            checkDateResetLocked();
+            return getEarningsWithoutResetLocked(player);
+        }
     }
 
     public static void addEarnings(Player player, double amount) {
-        checkDateReset();
-        dataConfig.set(EARNINGS_PATH + "." + player.getUniqueId(), getEarningsWithoutReset(player) + amount);
-        markDirty();
+        synchronized (DATA_LOCK) {
+            checkDateResetLocked();
+            dataConfig.set(EARNINGS_PATH + "." + player.getUniqueId(), getEarningsWithoutResetLocked(player) + amount);
+            markDirtyLocked();
+        }
     }
 
-    private static double getEarningsWithoutReset(Player player) {
+    private static double getEarningsWithoutResetLocked(Player player) {
         return dataConfig.getDouble(EARNINGS_PATH + "." + player.getUniqueId(), 0.0D);
     }
 
@@ -102,7 +119,7 @@ public class DailyEarningsManager {
         flushDirtyData();
     }
 
-    private static void markDirty() {
+    private static void markDirtyLocked() {
         dirty = true;
     }
 
@@ -113,26 +130,38 @@ public class DailyEarningsManager {
         if (saveTask != null) {
             saveTask.cancel();
         }
-        saveTask = plugin.getServer().getScheduler().runTaskTimer(plugin,
+        saveTask = plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin,
                 DailyEarningsManager::flushDirtyData,
                 SAVE_INTERVAL_TICKS,
                 SAVE_INTERVAL_TICKS);
     }
 
     private static void flushDirtyData() {
-        if (!dirty) {
-            return;
-        }
-        ensureInitialized();
-        try {
-            dataConfig.save(dataFile);
-            dirty = false;
-        } catch (IOException e) {
-            plugin.getLogger().log(Level.SEVERE, "Could not save daily_earnings.yml", e);
+        synchronized (SAVE_LOCK) {
+            String serializedData;
+            File targetFile;
+            synchronized (DATA_LOCK) {
+                if (!dirty) {
+                    return;
+                }
+                ensureInitializedLocked();
+                serializedData = dataConfig.saveToString();
+                targetFile = dataFile;
+                dirty = false;
+            }
+
+            try {
+                Files.writeString(targetFile.toPath(), serializedData, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                synchronized (DATA_LOCK) {
+                    dirty = true;
+                }
+                plugin.getLogger().log(Level.SEVERE, "Could not save daily_earnings.yml", e);
+            }
         }
     }
 
-    private static void ensureInitialized() {
+    private static void ensureInitializedLocked() {
         if (dataConfig == null) {
             dataFile = new File(plugin.getDataFolder(), "daily_earnings.yml");
             dataConfig = YamlConfiguration.loadConfiguration(dataFile);

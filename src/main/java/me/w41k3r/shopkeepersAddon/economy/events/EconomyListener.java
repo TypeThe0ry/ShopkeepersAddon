@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
@@ -79,12 +80,17 @@ public class EconomyListener implements Listener {
 
     private volatile Map<String, String> ownerUuidByShopkeeperId = Collections.emptyMap();
     private long ownerCacheLastModified = Long.MIN_VALUE;
-    private long nextOwnerCacheRefreshMillis;
+    private final AtomicBoolean ownerCacheRefreshInProgress = new AtomicBoolean(false);
 
     private enum TradeProcessResult {
         SUCCESS,
         HANDLED_FAILURE,
         UNRECOVERABLE_FAILURE
+    }
+
+    public EconomyListener() {
+        Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::refreshOwnerUuidCache,
+                0L, OWNER_CACHE_REFRESH_INTERVAL_MILLIS / 50L);
     }
 
     @EventHandler
@@ -359,6 +365,19 @@ public class EconomyListener implements Listener {
             return;
         }
 
+        Inventory stockInventory = null;
+        if (!(shopkeeper instanceof AdminShopkeeper)) {
+            stockInventory = getPlayerShopStockInventory(shopkeeper);
+            if (stockInventory == null) {
+                return;
+            }
+            int stockLimitedTrades = countStockTrades(stockInventory, recipe.getResultItem().copy());
+            tradeCount = Math.min(tradeCount, stockLimitedTrades);
+            if (tradeCount <= 0) {
+                return;
+            }
+        }
+
         double pricePerTrade = getPrice(recipe.getItem1().copy());
         double totalPrice = pricePerTrade * tradeCount;
 
@@ -374,7 +393,14 @@ public class EconomyListener implements Listener {
             return;
         }
 
+        if (stockInventory != null && !removeStockItems(stockInventory, payoutItems)) {
+            return;
+        }
+
         if (!consumeSecondIngredientNow(event, recipe, tradeCount)) {
+            if (stockInventory != null) {
+                returnStockItems(stockInventory, payoutItems);
+            }
             return;
         }
 
@@ -382,13 +408,6 @@ public class EconomyListener implements Listener {
 
         addItemsOrDrop(player, payoutItems);
         if (!(shopkeeper instanceof AdminShopkeeper)) {
-            PlayerShopkeeper playerShopkeeper = (PlayerShopkeeper) shopkeeper;
-            if (playerShopkeeper.getContainer().getState() instanceof Container cont) {
-                Inventory inv = cont.getInventory();
-                for (ItemStack payoutItem : payoutItems) {
-                    inv.removeItem(payoutItem);
-                }
-            }
             depositToShopOwner(shopkeeper, totalPrice);
 
         }
@@ -482,6 +501,52 @@ public class EconomyListener implements Listener {
         for (ItemStack item : items) {
             Map<Integer, ItemStack> leftovers = player.getInventory().addItem(item);
             dropLeftovers(player, leftovers);
+        }
+    }
+
+    private Inventory getPlayerShopStockInventory(Shopkeeper shopkeeper) {
+        if (!(shopkeeper instanceof PlayerShopkeeper playerShopkeeper)) {
+            return null;
+        }
+        if (!(playerShopkeeper.getContainer().getState() instanceof Container container)) {
+            return null;
+        }
+        return container.getInventory();
+    }
+
+    private int countStockTrades(Inventory stockInventory, ItemStack resultItem) {
+        if (isEmpty(resultItem)) {
+            return 0;
+        }
+        MatchCache matchCache = new MatchCache();
+        int available = countMatching(stockInventory, resultItem, matchCache);
+        return available / resultItem.getAmount();
+    }
+
+    private boolean removeStockItems(Inventory stockInventory, List<ItemStack> items) {
+        MatchCache matchCache = new MatchCache();
+        List<ItemStack> removedItems = new ArrayList<>();
+        for (ItemStack item : items) {
+            int removed = removeMatching(stockInventory, item, item.getAmount(), matchCache);
+            if (removed > 0) {
+                ItemStack removedItem = item.clone();
+                removedItem.setAmount(removed);
+                removedItems.add(removedItem);
+            }
+            if (removed != item.getAmount()) {
+                returnStockItems(stockInventory, removedItems);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void returnStockItems(Inventory stockInventory, List<ItemStack> items) {
+        for (ItemStack item : items) {
+            Map<Integer, ItemStack> leftovers = stockInventory.addItem(item.clone());
+            if (!leftovers.isEmpty()) {
+                debugLog("Could not fully return stock after failed bulk trade.");
+            }
         }
     }
 
@@ -810,15 +875,25 @@ public class EconomyListener implements Listener {
             }
 
             ItemStack required = ingredient.clone();
-            required.setAmount(ingredient.getAmount() * multiplier);
+            required.setAmount(multiplyAmountCapped(ingredient.getAmount(), multiplier));
             ItemStack existing = findMatchingIngredient(aggregated, required, matchCache);
             if (existing == null) {
                 aggregated.add(required);
             } else {
-                existing.setAmount(existing.getAmount() + required.getAmount());
+                existing.setAmount(addAmountsCapped(existing.getAmount(), required.getAmount()));
             }
         }
         return aggregated;
+    }
+
+    private int multiplyAmountCapped(int amount, int multiplier) {
+        long result = (long) amount * multiplier;
+        return result > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) result;
+    }
+
+    private int addAmountsCapped(int first, int second) {
+        long result = (long) first + second;
+        return result > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) result;
     }
 
     private ItemStack findMatchingIngredient(List<ItemStack> ingredients, ItemStack target, MatchCache matchCache) {
@@ -840,7 +915,7 @@ public class EconomyListener implements Listener {
             return true;
         }
         MatchCache matchCache = new MatchCache();
-        int required = ingredient.getAmount() * tradeCount;
+        int required = multiplyAmountCapped(ingredient.getAmount(), tradeCount);
         int before = countMatchingInput(merchantInventory, ingredient, matchCache);
         if (before < required) {
             return false;
@@ -871,7 +946,7 @@ public class EconomyListener implements Listener {
         if (ingredient == null) {
             return true;
         }
-        int required = ingredient.getAmount() * tradeCount;
+        int required = multiplyAmountCapped(ingredient.getAmount(), tradeCount);
         Inventory playerInventory = getPlayerInventory(event);
         Inventory merchantInventory = getMerchantInventory(event);
         MatchCache matchCache = new MatchCache();
@@ -1142,7 +1217,8 @@ public class EconomyListener implements Listener {
             }
             String value = meta.getPersistentDataContainer().get(namespacedKey, PersistentDataType.STRING);
             return value == null || value.isBlank() ? null : value;
-        } catch (Throwable ignored) {
+        } catch (IllegalArgumentException | IllegalStateException | NoSuchMethodError e) {
+            debugLog("Could not read persistent item metadata '" + key + "': " + e.getMessage());
             return null;
         }
     }
@@ -1183,7 +1259,8 @@ public class EconomyListener implements Listener {
             if (meta.hasCustomModelData()) {
                 return normalizeCustomModelData(String.valueOf(meta.getCustomModelData()));
             }
-        } catch (Throwable ignored) {
+        } catch (IllegalStateException | NoSuchMethodError e) {
+            debugLog("Could not read custom model data: " + e.getMessage());
         }
         if (metaString == null) {
             return null;
@@ -1411,7 +1488,6 @@ public class EconomyListener implements Listener {
         }
         String shopkeeperId = String.valueOf(shopkeeper.getId());
         try {
-            refreshOwnerUuidCache();
             return ownerUuidByShopkeeperId.get(shopkeeperId);
         } catch (Exception e) {
             Bukkit.getLogger().log(Level.SEVERE, "Failed to get owner UUID for shopkeeper: " + shopkeeper.getId(), e);
@@ -1437,33 +1513,37 @@ public class EconomyListener implements Listener {
     }
 
     private void refreshOwnerUuidCache() {
-        long now = System.currentTimeMillis();
-        if (now < nextOwnerCacheRefreshMillis) {
-            return;
-        }
-        nextOwnerCacheRefreshMillis = now + OWNER_CACHE_REFRESH_INTERVAL_MILLIS;
-
-        File dataFile = new File(plugin.getDataFolder().getParentFile(), SHOPKEEPERS_DATA_PATH);
-        if (!dataFile.isFile() || !dataFile.canRead()) {
-            debugLog("Shopkeepers owner data file is missing or unreadable; keeping existing owner UUID cache.");
+        if (!ownerCacheRefreshInProgress.compareAndSet(false, true)) {
             return;
         }
 
-        long lastModified = dataFile.lastModified();
-        if (lastModified == ownerCacheLastModified) {
-            return;
-        }
-
-        YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-        Map<String, String> refreshedOwnerUuids = new HashMap<>();
-        for (String shopkeeperId : dataConfig.getKeys(false)) {
-            String ownerUUID = dataConfig.getString(shopkeeperId + OWNER_UUID_PATH);
-            if (ownerUUID != null) {
-                refreshedOwnerUuids.put(shopkeeperId, ownerUUID);
+        try {
+            File dataFile = new File(plugin.getDataFolder().getParentFile(), SHOPKEEPERS_DATA_PATH);
+            if (!dataFile.isFile() || !dataFile.canRead()) {
+                debugLog("Shopkeepers owner data file is missing or unreadable; keeping existing owner UUID cache.");
+                return;
             }
+
+            long lastModified = dataFile.lastModified();
+            if (lastModified == ownerCacheLastModified) {
+                return;
+            }
+
+            YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+            Map<String, String> refreshedOwnerUuids = new HashMap<>();
+            for (String shopkeeperId : dataConfig.getKeys(false)) {
+                String ownerUUID = dataConfig.getString(shopkeeperId + OWNER_UUID_PATH);
+                if (ownerUUID != null) {
+                    refreshedOwnerUuids.put(shopkeeperId, ownerUUID);
+                }
+            }
+            ownerUuidByShopkeeperId = Collections.unmodifiableMap(refreshedOwnerUuids);
+            ownerCacheLastModified = lastModified;
+        } catch (RuntimeException e) {
+            debugLog("Failed to refresh Shopkeepers owner UUID cache: " + e.getMessage());
+        } finally {
+            ownerCacheRefreshInProgress.set(false);
         }
-        ownerUuidByShopkeeperId = Collections.unmodifiableMap(refreshedOwnerUuids);
-        ownerCacheLastModified = lastModified;
     }
 
     /**
@@ -1492,9 +1572,9 @@ public class EconomyListener implements Listener {
                 if (ingredient == null || ingredient.getType() == Material.AIR)
                     continue;
 
-                ItemStack toAdd = ingredient.clone();
-                toAdd.setAmount(ingredient.getAmount() * multiplier);
-                container.addItem(toAdd);
+                for (ItemStack toAdd : createStackedItems(ingredient, multiplier)) {
+                    container.addItem(toAdd);
+                }
             }
         } catch (Exception e) {
             Bukkit.getLogger().log(Level.SEVERE, "Failed to deposit ingredients to shop container", e);

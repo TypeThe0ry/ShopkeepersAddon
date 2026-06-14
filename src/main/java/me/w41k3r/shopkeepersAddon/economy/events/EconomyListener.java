@@ -3,6 +3,8 @@ package me.w41k3r.shopkeepersAddon.economy.events;
 import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -75,7 +77,7 @@ public class EconomyListener implements Listener {
 
     private static final ConcurrentMap<Class<?>, Optional<Method>> META_GET_AS_STRING_METHODS = new ConcurrentHashMap<>();
 
-    private final Map<String, String> ownerUuidByShopkeeperId = new ConcurrentHashMap<>();
+    private volatile Map<String, String> ownerUuidByShopkeeperId = Collections.emptyMap();
     private long ownerCacheLastModified = Long.MIN_VALUE;
     private long nextOwnerCacheRefreshMillis;
 
@@ -110,7 +112,6 @@ public class EconomyListener implements Listener {
 
         ItemStack firstIngredient = recipe.getIngredients().get(0);
         if (!isEconomyItem(firstIngredient) && !isEconomyItem(recipe.getResult())) {
-            scheduleRemoveEconomyItem(player);
             return;
         }
 
@@ -366,10 +367,9 @@ public class EconomyListener implements Listener {
             return;
         }
 
-        ItemStack resultItem = recipe.getResultItem().copy();
-        resultItem.setAmount(tradeCount * resultItem.getAmount());
+        List<ItemStack> payoutItems = createStackedItems(recipe.getResultItem().copy(), tradeCount);
 
-        if (!canFitItem(player.getInventory(), resultItem)) {
+        if (!canFitItems(player.getInventory(), payoutItems)) {
             sendPlayerMessage(player, config.getString("messages.inventoryFull", INVENTORY_FULL_FALLBACK));
             return;
         }
@@ -380,13 +380,14 @@ public class EconomyListener implements Listener {
 
         EconomyManager.takeMoney(player.getName(), totalPrice);
 
-        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(resultItem);
-        dropLeftovers(player, leftovers);
+        addItemsOrDrop(player, payoutItems);
         if (!(shopkeeper instanceof AdminShopkeeper)) {
             PlayerShopkeeper playerShopkeeper = (PlayerShopkeeper) shopkeeper;
             if (playerShopkeeper.getContainer().getState() instanceof Container cont) {
                 Inventory inv = cont.getInventory();
-                inv.removeItem(resultItem);
+                for (ItemStack payoutItem : payoutItems) {
+                    inv.removeItem(payoutItem);
+                }
             }
             depositToShopOwner(shopkeeper, totalPrice);
 
@@ -403,27 +404,85 @@ public class EconomyListener implements Listener {
         }, 1L);
     }
 
-    private boolean canFitItem(Inventory inventory, ItemStack item) {
-        if (inventory == null || isEmpty(item)) {
+    private boolean canFitItems(Inventory inventory, List<ItemStack> items) {
+        if (inventory == null || items == null || items.isEmpty()) {
             return false;
         }
 
+        ItemStack[] storageContents = cloneContents(inventory.getStorageContents());
+        for (ItemStack item : items) {
+            if (!fitItem(storageContents, inventory.getMaxStackSize(), item)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private ItemStack[] cloneContents(ItemStack[] contents) {
+        ItemStack[] copy = new ItemStack[contents.length];
+        for (int slot = 0; slot < contents.length; slot++) {
+            copy[slot] = contents[slot] == null ? null : contents[slot].clone();
+        }
+        return copy;
+    }
+
+    private boolean fitItem(ItemStack[] contents, int inventoryMaxStackSize, ItemStack item) {
+        if (isEmpty(item)) {
+            return true;
+        }
+
         int remaining = item.getAmount();
-        int maxStackSize = Math.min(inventory.getMaxStackSize(), item.getMaxStackSize());
+        int maxStackSize = Math.min(inventoryMaxStackSize, item.getMaxStackSize());
         if (maxStackSize <= 0) {
             return false;
         }
-        for (ItemStack content : inventory.getStorageContents()) {
+
+        for (ItemStack content : contents) {
             if (remaining <= 0) {
                 return true;
             }
-            if (isEmpty(content)) {
-                remaining -= maxStackSize;
-            } else if (content.isSimilar(item) && content.getAmount() < maxStackSize) {
-                remaining -= maxStackSize - content.getAmount();
+            if (!isEmpty(content) && content.isSimilar(item) && content.getAmount() < maxStackSize) {
+                int add = Math.min(remaining, maxStackSize - content.getAmount());
+                content.setAmount(content.getAmount() + add);
+                remaining -= add;
+            }
+        }
+
+        for (int slot = 0; slot < contents.length && remaining > 0; slot++) {
+            if (isEmpty(contents[slot])) {
+                ItemStack stack = item.clone();
+                int add = Math.min(remaining, maxStackSize);
+                stack.setAmount(add);
+                contents[slot] = stack;
+                remaining -= add;
             }
         }
         return remaining <= 0;
+    }
+
+    private List<ItemStack> createStackedItems(ItemStack item, int multiplier) {
+        List<ItemStack> items = new ArrayList<>();
+        if (isEmpty(item) || multiplier <= 0) {
+            return items;
+        }
+
+        long totalAmount = (long) item.getAmount() * multiplier;
+        int maxStackSize = Math.max(1, item.getMaxStackSize());
+        while (totalAmount > 0) {
+            ItemStack stack = item.clone();
+            int stackAmount = (int) Math.min(maxStackSize, totalAmount);
+            stack.setAmount(stackAmount);
+            items.add(stack);
+            totalAmount -= stackAmount;
+        }
+        return items;
+    }
+
+    private void addItemsOrDrop(Player player, List<ItemStack> items) {
+        for (ItemStack item : items) {
+            Map<Integer, ItemStack> leftovers = player.getInventory().addItem(item);
+            dropLeftovers(player, leftovers);
+        }
     }
 
     private void dropLeftovers(Player player, Map<Integer, ItemStack> leftovers) {
@@ -1385,21 +1444,25 @@ public class EconomyListener implements Listener {
         nextOwnerCacheRefreshMillis = now + OWNER_CACHE_REFRESH_INTERVAL_MILLIS;
 
         File dataFile = new File(plugin.getDataFolder().getParentFile(), SHOPKEEPERS_DATA_PATH);
+        if (!dataFile.isFile() || !dataFile.canRead()) {
+            debugLog("Shopkeepers owner data file is missing or unreadable; keeping existing owner UUID cache.");
+            return;
+        }
+
         long lastModified = dataFile.lastModified();
         if (lastModified == ownerCacheLastModified) {
             return;
         }
 
         YamlConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-        Map<String, String> refreshedOwnerUuids = new ConcurrentHashMap<>();
+        Map<String, String> refreshedOwnerUuids = new HashMap<>();
         for (String shopkeeperId : dataConfig.getKeys(false)) {
             String ownerUUID = dataConfig.getString(shopkeeperId + OWNER_UUID_PATH);
             if (ownerUUID != null) {
                 refreshedOwnerUuids.put(shopkeeperId, ownerUUID);
             }
         }
-        ownerUuidByShopkeeperId.clear();
-        ownerUuidByShopkeeperId.putAll(refreshedOwnerUuids);
+        ownerUuidByShopkeeperId = Collections.unmodifiableMap(refreshedOwnerUuids);
         ownerCacheLastModified = lastModified;
     }
 

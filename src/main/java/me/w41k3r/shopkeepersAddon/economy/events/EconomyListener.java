@@ -59,7 +59,7 @@ public class EconomyListener implements Listener {
     private static final int REMOVE_ECONOMY_ITEM_DELAY = 1;
     private static final String BUY_SUCCESS_FALLBACK = "§aYou have bought %item% for %price%.";
     private static final String DAILY_LIMIT_FALLBACK = "§cDaily earning limit reached! You can only earn %remaining% more today (Limit: %limit%).";
-    private static final String ERROR_FALLBACK = "&cAn error occurred while processing the transaction.";
+    private static final String ERROR_FALLBACK = "§cAn error occurred while processing the transaction.";
     private static final String INVENTORY_FULL_FALLBACK = "§cYou don't have enough inventory space for this trade.";
 
     private static final String SHOPKEEPERS_DATA_PATH = "Shopkeepers/data/save.yml";
@@ -146,9 +146,9 @@ public class EconomyListener implements Listener {
     @EventHandler
     public void onShopkeeperTrade(ShopkeeperTradeEvent event) {
         TradingRecipe recipe = event.getTradingRecipe();
+        InventoryClickEvent clickEvent = event.getClickEvent();
         if (isEconomyItem(recipe.getResultItem().copy())) {
             event.setCancelled(true);
-            InventoryClickEvent clickEvent = event.getClickEvent();
             boolean processed = false;
             String failureReason = null;
             if (clickEvent != null) {
@@ -180,17 +180,23 @@ public class EconomyListener implements Listener {
         Player player = event.getPlayer();
         Shopkeeper shopkeeper = event.getShopkeeper();
 
-        if (event.getClickEvent().isShiftClick()) {
+        if (clickEvent != null && clickEvent.isShiftClick()) {
             // Only process bulk trade if it is an economy trade (Buying)
             if (isEconomyItem(recipe.getItem1().copy())) {
                 event.setCancelled(true);
-                processBulkTrade(player, shopkeeper, recipe, event.getClickEvent(), getInputTradeCount(event.getClickEvent()));
+                processBulkTrade(player, shopkeeper, recipe, clickEvent, getInputTradeCount(clickEvent));
                 return;
             }
         }
 
         if (isEconomyItem(recipe.getItem1().copy())) {
-            if (!processEconomyTrade(player, shopkeeper, recipe, event.getClickEvent())) {
+            if (clickEvent == null) {
+                event.setCancelled(true);
+                sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
+                debugLog("Cancelled economy-input trade without processing it: trade event did not include a click event");
+                return;
+            }
+            if (!processEconomyTrade(player, shopkeeper, recipe, clickEvent)) {
                 event.setCancelled(true);
             } else {
                 // Post-Trade UI Update
@@ -587,7 +593,10 @@ public class EconomyListener implements Listener {
             int removedFromMerchant = removeMatchingInput(merchantInventory, ingredient, required);
             int remaining = required - removedFromMerchant;
             int removedFromPlayer = remaining > 0 ? removeMatching(playerInventory, ingredient, remaining) : 0;
-            consumedAny |= removedFromPlayer + removedFromMerchant == required;
+            if (removedFromPlayer + removedFromMerchant != required) {
+                return false;
+            }
+            consumedAny = true;
             cleanupTargets.add(ingredient.clone());
             expectedRemaining.add(countMatching(playerInventory, ingredient) + countMatchingInput(merchantInventory, ingredient));
         }
@@ -988,7 +997,7 @@ public class EconomyListener implements Listener {
         String ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
         if (ownerName == null) {
             debugLog("Could not determine owner name for UUID: " + ownerUUID);
-            sendPlayerMessage(player, config.getString("messages.error", "&cAn error occurred while processing the transaction."));
+            sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
             return false;
         }
 
@@ -1114,6 +1123,3 @@ public class EconomyListener implements Listener {
         }
     }
 }
-
-
-

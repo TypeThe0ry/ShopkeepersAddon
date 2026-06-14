@@ -2,8 +2,8 @@ package me.w41k3r.shopkeepersAddon.economy;
 
 import java.io.File;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.logging.Level;
 
 import org.bukkit.configuration.file.FileConfiguration;
@@ -16,7 +16,6 @@ import static me.w41k3r.shopkeepersAddon.ShopkeepersAddon.plugin;
 
 public class DailyEarningsManager {
 
-    private static final String DATE_FORMAT = "yyyy-MM-dd";
     private static final String LAST_RESET_PATH = "last-reset";
     private static final String EARNINGS_PATH = "earnings";
     private static final long SAVE_INTERVAL_TICKS = 20L * 60L;
@@ -24,6 +23,7 @@ public class DailyEarningsManager {
     private static File dataFile;
     private static FileConfiguration dataConfig;
     private static String lastResetDate;
+    private static long nextDateCheckMillis;
     private static boolean dirty;
     private static BukkitTask saveTask;
 
@@ -45,7 +45,17 @@ public class DailyEarningsManager {
 
     private static void checkDateReset() {
         ensureInitialized();
-        String today = new SimpleDateFormat(DATE_FORMAT).format(new Date());
+        long now = System.currentTimeMillis();
+        if (now < nextDateCheckMillis) {
+            return;
+        }
+
+        LocalDate todayDate = LocalDate.now();
+        String today = todayDate.toString();
+        nextDateCheckMillis = todayDate.plusDays(1)
+                .atStartOfDay(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli();
         if (!today.equals(lastResetDate)) {
             dataConfig.set(EARNINGS_PATH, null);
             dataConfig.set(LAST_RESET_PATH, today);

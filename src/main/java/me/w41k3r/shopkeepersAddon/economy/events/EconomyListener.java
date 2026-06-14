@@ -453,7 +453,7 @@ public class EconomyListener implements Listener {
             double pricePerTrade) {
         int maxTrades = event.isShiftClick()
                 ? calculateShiftClickTrades(event, ingredients, shopkeeper, pricePerTrade)
-                : Math.min(1, calculateMaxTradesByIngredients(event, ingredients));
+                : Math.min(1, calculateMaxTradesByIngredients(event, ingredients, false));
 
         if (shopkeeper instanceof AdminShopkeeper && DailyEarningsManager.isLimitEnabled()) {
             Player player = (Player) event.getWhoClicked();
@@ -467,7 +467,7 @@ public class EconomyListener implements Listener {
 
     private int calculateShiftClickTrades(InventoryClickEvent event, List<ItemStack> ingredients,
             Shopkeeper shopkeeper, double pricePerTrade) {
-        int maxTradesByItems = calculateMaxTradesByIngredients(event, ingredients);
+        int maxTradesByItems = calculateMaxTradesByIngredients(event, ingredients, true);
 
         if (shopkeeper instanceof AdminShopkeeper) {
             return maxTradesByItems;
@@ -479,17 +479,13 @@ public class EconomyListener implements Listener {
         return Math.min(maxTradesByItems, affordableTrades);
     }
 
-    private int calculateMaxTradesByIngredients(InventoryClickEvent event, List<ItemStack> ingredients) {
+    private int calculateMaxTradesByIngredients(InventoryClickEvent event, List<ItemStack> ingredients,
+            boolean includePlayerInventory) {
         int maxTrades = Integer.MAX_VALUE;
 
-        for (ItemStack ingredient : ingredients) {
-            if (isEmpty(ingredient)) {
-                continue;
-            }
-
+        for (ItemStack ingredient : aggregateIngredients(ingredients, 1)) {
             int required = ingredient.getAmount();
-            int available = countMatching(getPlayerInventory(event), ingredient)
-                    + countMatchingInput(getMerchantInventory(event), ingredient);
+            int available = countAvailableIngredients(event, ingredient, includePlayerInventory);
             maxTrades = Math.min(maxTrades, available / required);
         }
 
@@ -564,6 +560,7 @@ public class EconomyListener implements Listener {
         if (event == null || tradeCount <= 0) {
             return false;
         }
+        boolean includePlayerInventory = event.isShiftClick();
 
         Inventory playerInventory = getPlayerInventory(event);
         Inventory merchantInventory = getMerchantInventory(event);
@@ -571,12 +568,10 @@ public class EconomyListener implements Listener {
             return false;
         }
 
-        for (ItemStack ingredient : ingredients) {
-            if (isEmpty(ingredient)) {
-                continue;
-            }
-            int required = ingredient.getAmount() * tradeCount;
-            int available = countMatching(playerInventory, ingredient) + countMatchingInput(merchantInventory, ingredient);
+        List<ItemStack> requiredIngredients = aggregateIngredients(ingredients, tradeCount);
+        for (ItemStack ingredient : requiredIngredients) {
+            int required = ingredient.getAmount();
+            int available = countAvailableIngredients(event, ingredient, includePlayerInventory);
             if (available < required) {
                 return false;
             }
@@ -585,23 +580,54 @@ public class EconomyListener implements Listener {
         boolean consumedAny = false;
         List<ItemStack> cleanupTargets = new ArrayList<>();
         List<Integer> expectedRemaining = new ArrayList<>();
-        for (ItemStack ingredient : ingredients) {
-            if (isEmpty(ingredient)) {
-                continue;
-            }
-            int required = ingredient.getAmount() * tradeCount;
+        for (ItemStack ingredient : requiredIngredients) {
+            int required = ingredient.getAmount();
             int removedFromMerchant = removeMatchingInput(merchantInventory, ingredient, required);
             int remaining = required - removedFromMerchant;
-            int removedFromPlayer = remaining > 0 ? removeMatching(playerInventory, ingredient, remaining) : 0;
+            int removedFromPlayer = includePlayerInventory && remaining > 0
+                    ? removeMatching(playerInventory, ingredient, remaining)
+                    : 0;
             if (removedFromPlayer + removedFromMerchant != required) {
                 return false;
             }
             consumedAny = true;
             cleanupTargets.add(ingredient.clone());
-            expectedRemaining.add(countMatching(playerInventory, ingredient) + countMatchingInput(merchantInventory, ingredient));
+            expectedRemaining.add(countMatchingInput(merchantInventory, ingredient));
         }
-        scheduleIngredientCleanup(playerInventory, merchantInventory, cleanupTargets, expectedRemaining);
+        scheduleIngredientCleanup(merchantInventory, cleanupTargets, expectedRemaining);
         return consumedAny;
+    }
+
+    private List<ItemStack> aggregateIngredients(List<ItemStack> ingredients, int multiplier) {
+        List<ItemStack> aggregated = new ArrayList<>();
+        if (ingredients == null || multiplier <= 0) {
+            return aggregated;
+        }
+
+        for (ItemStack ingredient : ingredients) {
+            if (isEmpty(ingredient)) {
+                continue;
+            }
+
+            ItemStack required = ingredient.clone();
+            required.setAmount(ingredient.getAmount() * multiplier);
+            ItemStack existing = findMatchingIngredient(aggregated, required);
+            if (existing == null) {
+                aggregated.add(required);
+            } else {
+                existing.setAmount(existing.getAmount() + required.getAmount());
+            }
+        }
+        return aggregated;
+    }
+
+    private ItemStack findMatchingIngredient(List<ItemStack> ingredients, ItemStack target) {
+        for (ItemStack ingredient : ingredients) {
+            if (matches(ingredient, target) && matches(target, ingredient)) {
+                return ingredient;
+            }
+        }
+        return null;
     }
 
     private boolean scheduleSecondIngredientCleanup(InventoryClickEvent event, TradingRecipe recipe, int tradeCount) {
@@ -609,10 +635,9 @@ public class EconomyListener implements Listener {
         if (ingredient == null) {
             return true;
         }
-        Inventory playerInventory = getPlayerInventory(event);
         Inventory merchantInventory = getMerchantInventory(event);
         int required = ingredient.getAmount() * tradeCount;
-        int before = countMatching(playerInventory, ingredient) + countMatchingInput(merchantInventory, ingredient);
+        int before = countMatchingInput(merchantInventory, ingredient);
         if (before < required) {
             return false;
         }
@@ -621,7 +646,7 @@ public class EconomyListener implements Listener {
         List<Integer> expectedRemaining = new ArrayList<>();
         cleanupTargets.add(ingredient.clone());
         expectedRemaining.add(before - required);
-        scheduleIngredientCleanup(playerInventory, merchantInventory, cleanupTargets, expectedRemaining);
+        scheduleIngredientCleanup(merchantInventory, cleanupTargets, expectedRemaining);
         return true;
     }
 
@@ -701,8 +726,17 @@ public class EconomyListener implements Listener {
         return count;
     }
 
-    private void scheduleIngredientCleanup(Inventory playerInventory, Inventory merchantInventory,
-            List<ItemStack> targets, List<Integer> expectedRemaining) {
+    private int countAvailableIngredients(InventoryClickEvent event, ItemStack target,
+            boolean includePlayerInventory) {
+        int available = countMatchingInput(getMerchantInventory(event), target);
+        if (includePlayerInventory) {
+            available += countMatching(getPlayerInventory(event), target);
+        }
+        return available;
+    }
+
+    private void scheduleIngredientCleanup(Inventory merchantInventory, List<ItemStack> targets,
+            List<Integer> expectedRemaining) {
         if (targets.isEmpty()) {
             return;
         }
@@ -710,16 +744,13 @@ public class EconomyListener implements Listener {
             for (int index = 0; index < targets.size(); index++) {
                 ItemStack target = targets.get(index);
                 int expected = expectedRemaining.get(index);
-                int current = countMatching(playerInventory, target) + countMatchingInput(merchantInventory, target);
+                int current = countMatchingInput(merchantInventory, target);
                 if (current > expected) {
-                    int extra = current - expected;
-                    int removedFromMerchant = removeMatchingInput(merchantInventory, target, extra);
-                    if (removedFromMerchant < extra) {
-                        removeMatching(playerInventory, target, extra - removedFromMerchant);
-                    }
+                    removeMatchingInput(merchantInventory, target, current - expected);
                 }
             }
-            if (playerInventory != null && playerInventory.getHolder() instanceof Player player) {
+            if (merchantInventory instanceof MerchantInventory merchant
+                    && merchant.getViewers().stream().findFirst().orElse(null) instanceof Player player) {
                 player.updateInventory();
             }
         }, 1L);

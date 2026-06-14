@@ -7,12 +7,14 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.block.Chest;
 import org.bukkit.block.Container;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -32,6 +34,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.MerchantInventory;
 import org.bukkit.inventory.MerchantRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.persistence.PersistentDataType;
 
 import com.nisovin.shopkeepers.api.ShopkeepersAPI;
 import com.nisovin.shopkeepers.api.events.ShopkeeperOpenUIEvent;
@@ -68,6 +71,12 @@ public class EconomyListener implements Listener {
     private static final String OWNER_UUID_PATH = ".owner uuid";
 
     private static final ConcurrentMap<Class<?>, Optional<Method>> META_GET_AS_STRING_METHODS = new ConcurrentHashMap<>();
+
+    private enum TradeProcessResult {
+        SUCCESS,
+        HANDLED_FAILURE,
+        UNRECOVERABLE_FAILURE
+    }
 
     @EventHandler
     public void onOpenEditorUI(ShopkeeperOpenUIEvent event) {
@@ -166,7 +175,19 @@ public class EconomyListener implements Listener {
                     failureReason = "click event did not expose a merchant inventory";
                 }
             } else {
-                failureReason = "trade event did not include a click event";
+                MerchantInventory merchantInventory = getOpenMerchantInventory(event.getPlayer());
+                if (merchantInventory != null) {
+                    MerchantRecipe selectedRecipe = merchantInventory.getSelectedRecipe();
+                    TradeProcessResult result = processEconomyTradeFallback(event.getPlayer(), event.getShopkeeper(),
+                            merchantInventory, selectedRecipe, recipe);
+                    if (result != TradeProcessResult.UNRECOVERABLE_FAILURE) {
+                        processed = true;
+                    } else {
+                        failureReason = "fallback merchant trade processing failed";
+                    }
+                } else {
+                    failureReason = "trade event did not include a click event and no open merchant inventory was found";
+                }
             }
             if (!processed) {
                 sendPlayerMessage(event.getPlayer(), config.getString("messages.error", ERROR_FALLBACK));
@@ -192,9 +213,28 @@ public class EconomyListener implements Listener {
 
         if (isEconomyItem(recipe.getItem1().copy())) {
             if (clickEvent == null) {
-                event.setCancelled(true);
-                sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
-                debugLog("Cancelled economy-input trade without processing it: trade event did not include a click event");
+                MerchantInventory merchantInventory = getOpenMerchantInventory(player);
+                TradeProcessResult result = merchantInventory == null
+                        ? TradeProcessResult.UNRECOVERABLE_FAILURE
+                        : processEconomyTradeFallback(player, shopkeeper, recipe, merchantInventory);
+                if (result == TradeProcessResult.UNRECOVERABLE_FAILURE) {
+                    event.setCancelled(true);
+                    sendPlayerMessage(player, config.getString("messages.error", ERROR_FALLBACK));
+                    debugLog("Cancelled economy-input trade without processing it: "
+                            + (merchantInventory == null
+                                    ? "trade event did not include a click event and no open merchant inventory was found"
+                                    : "fallback merchant trade processing failed"));
+                    return;
+                }
+                if (result == TradeProcessResult.HANDLED_FAILURE) {
+                    event.setCancelled(true);
+                    return;
+                }
+                Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                   if (ShopkeepersAPI.getUIRegistry().getUISession(player) != null) {
+                        updateTradeSlotsPostTrade(player, recipe, shopkeeper);
+                   }
+                }, 1L);
                 return;
             }
             if (!processEconomyTrade(player, shopkeeper, recipe, clickEvent)) {
@@ -210,6 +250,30 @@ public class EconomyListener implements Listener {
                 }, 1L);
             }
         }
+    }
+
+    private TradeProcessResult processEconomyTradeFallback(Player player, Shopkeeper shopkeeper, TradingRecipe recipe,
+            MerchantInventory merchantInventory) {
+        double price = getPrice(recipe.getItem1().copy());
+
+        if (!hasMoney(player, price)) {
+            sendPlayerMessage(player, config.getString("messages.noMoney", "You don't have enough money!"));
+            return TradeProcessResult.HANDLED_FAILURE;
+        }
+
+        if (!scheduleSecondIngredientCleanup(merchantInventory, recipe, 1)) {
+            return TradeProcessResult.UNRECOVERABLE_FAILURE;
+        }
+
+        EconomyManager.takeMoney(player.getName(), price);
+
+        if (!(shopkeeper instanceof AdminShopkeeper)) {
+            depositToShopOwner(shopkeeper, price);
+        }
+        sendPlayerMessage(player, config.getString("messages.buySuccess", BUY_SUCCESS_FALLBACK)
+                .replace("%item%", getItemDisplayNameSafe(recipe.getResultItem()))
+                .replace("%price%", formatPrice(price)));
+        return TradeProcessResult.SUCCESS;
     }
 
     private boolean processEconomyTrade(Player player, Shopkeeper shopkeeper, TradingRecipe recipe,
@@ -450,6 +514,77 @@ public class EconomyListener implements Listener {
                 .replace("%price%", formatPrice(totalPrice)));
     }
 
+    private TradeProcessResult processEconomyTradeFallback(Player player, Shopkeeper shopkeeper,
+            MerchantInventory merchantInventory,
+            MerchantRecipe merchantRecipe, TradingRecipe tradingRecipe) {
+        if (player == null || shopkeeper == null || merchantInventory == null || tradingRecipe == null) {
+            return TradeProcessResult.UNRECOVERABLE_FAILURE;
+        }
+
+        boolean isAdminShopkeeper = shopkeeper instanceof AdminShopkeeper;
+        ItemStack resultItem = tradingRecipe.getResultItem().copy();
+        if (!isEconomyItem(resultItem)) {
+            return TradeProcessResult.UNRECOVERABLE_FAILURE;
+        }
+
+        double pricePerTrade = getPrice(resultItem);
+        List<ItemStack> sellIngredients = getSellIngredients(merchantInventory, merchantRecipe, tradingRecipe);
+        int maxTrades = Math.min(1, calculateMaxTradesByIngredients(merchantInventory, null, sellIngredients, false));
+
+        if (isAdminShopkeeper && DailyEarningsManager.isLimitEnabled()) {
+            double remaining = DailyEarningsManager.getRemainingLimit(player);
+            if (remaining < pricePerTrade) {
+                sendPlayerMessage(player, config.getString("messages.dailyLimitReached", DAILY_LIMIT_FALLBACK)
+                        .replace("%limit%", formatPrice(DailyEarningsManager.getDailyLimit()))
+                        .replace("%remaining%", formatPrice(remaining)));
+                if (merchantRecipe != null) {
+                    merchantRecipe.setUses(merchantRecipe.getMaxUses());
+                }
+                return TradeProcessResult.HANDLED_FAILURE;
+            }
+        } else if (!isAdminShopkeeper && getOwnerMoney(shopkeeper) < pricePerTrade) {
+            if (merchantRecipe != null) {
+                merchantRecipe.setUses(merchantRecipe.getMaxUses());
+            }
+            sendPlayerMessage(player,
+                    config.getString("messages.noMoneyOwner", "The shop owner doesn't have enough money!"));
+            return TradeProcessResult.HANDLED_FAILURE;
+        }
+
+        String ownerName = null;
+        if (!isAdminShopkeeper) {
+            String ownerUUID = getShopkeeperOwnerUUID(shopkeeper);
+            if (ownerUUID == null) {
+                return TradeProcessResult.UNRECOVERABLE_FAILURE;
+            }
+            ownerName = Bukkit.getOfflinePlayer(java.util.UUID.fromString(ownerUUID)).getName();
+            if (ownerName == null) {
+                debugLog("Could not determine owner name for UUID: " + ownerUUID);
+                return TradeProcessResult.UNRECOVERABLE_FAILURE;
+            }
+        }
+
+        if (maxTrades <= 0 || !consumeSellIngredients(merchantInventory, null, false, sellIngredients, 1)) {
+            return TradeProcessResult.UNRECOVERABLE_FAILURE;
+        }
+
+        if (isAdminShopkeeper) {
+            EconomyManager.giveMoney(player.getName(), pricePerTrade);
+            if (DailyEarningsManager.isLimitEnabled()) {
+                DailyEarningsManager.addEarnings(player, pricePerTrade);
+            }
+        } else {
+            EconomyManager.takeMoney(ownerName, pricePerTrade);
+            EconomyManager.giveMoney(player.getName(), pricePerTrade);
+            depositIngredientsToContainer(shopkeeper, sellIngredients, 1);
+        }
+
+        sendPlayerMessage(player, config.getString("messages.sellSuccess", "You have sold %item% for %price%.")
+                .replace("%item%", getItemDisplayNameSafe(sellIngredients.isEmpty() ? null : sellIngredients.get(0)))
+                .replace("%price%", formatPrice(pricePerTrade)));
+        return TradeProcessResult.SUCCESS;
+    }
+
     private int calculateMaxTrades(InventoryClickEvent event, List<ItemStack> ingredients, Shopkeeper shopkeeper,
             double pricePerTrade) {
         int maxTrades = event.isShiftClick()
@@ -482,12 +617,19 @@ public class EconomyListener implements Listener {
 
     private int calculateMaxTradesByIngredients(InventoryClickEvent event, List<ItemStack> ingredients,
             boolean includePlayerInventory) {
+        return calculateMaxTradesByIngredients(getMerchantInventory(event), getPlayerInventory(event), ingredients,
+                includePlayerInventory);
+    }
+
+    private int calculateMaxTradesByIngredients(Inventory merchantInventory, Inventory playerInventory,
+            List<ItemStack> ingredients, boolean includePlayerInventory) {
         int maxTrades = Integer.MAX_VALUE;
         MatchCache matchCache = new MatchCache();
 
         for (ItemStack ingredient : aggregateIngredients(ingredients, 1)) {
             int required = ingredient.getAmount();
-            int available = countAvailableIngredients(event, ingredient, includePlayerInventory, matchCache);
+            int available = countAvailableIngredients(merchantInventory, playerInventory, ingredient,
+                    includePlayerInventory, matchCache);
             maxTrades = Math.min(maxTrades, available / required);
         }
 
@@ -535,6 +677,46 @@ public class EconomyListener implements Listener {
         return ingredients;
     }
 
+    private List<ItemStack> getSellIngredients(Inventory merchantInventory, MerchantRecipe merchantRecipe,
+            TradingRecipe tradingRecipe) {
+        List<ItemStack> ingredients = new ArrayList<>();
+
+        if (tradingRecipe != null) {
+            addSellIngredient(ingredients, tradingRecipe.getItem1().copy());
+            if (tradingRecipe.hasItem2()) {
+                addSellIngredient(ingredients, tradingRecipe.getItem2().copy());
+            }
+            if (!ingredients.isEmpty()) {
+                return ingredients;
+            }
+        }
+
+        if (merchantRecipe != null && merchantRecipe.getIngredients() != null) {
+            for (ItemStack ingredient : merchantRecipe.getIngredients()) {
+                addSellIngredient(ingredients, ingredient);
+            }
+            if (!ingredients.isEmpty()) {
+                return ingredients;
+            }
+            for (ItemStack ingredient : merchantRecipe.getIngredients()) {
+                if (!isEmpty(ingredient)) {
+                    ingredients.add(ingredient.clone());
+                }
+            }
+            if (!ingredients.isEmpty()) {
+                return ingredients;
+            }
+        }
+
+        if (merchantInventory instanceof MerchantInventory) {
+            for (int slot = 0; slot <= 1; slot++) {
+                addSellIngredient(ingredients, merchantInventory.getItem(slot));
+            }
+        }
+
+        return ingredients;
+    }
+
     private void addSellIngredient(List<ItemStack> ingredients, ItemStack item) {
         if (!isEmpty(item) && !isEconomyItem(item)) {
             ingredients.add(item.clone());
@@ -556,10 +738,15 @@ public class EconomyListener implements Listener {
         if (event == null || tradeCount <= 0) {
             return false;
         }
-        boolean includePlayerInventory = event.isShiftClick();
+        return consumeSellIngredients(getMerchantInventory(event), getPlayerInventory(event), event.isShiftClick(),
+                ingredients, tradeCount);
+    }
 
-        Inventory playerInventory = getPlayerInventory(event);
-        Inventory merchantInventory = getMerchantInventory(event);
+    private boolean consumeSellIngredients(Inventory merchantInventory, Inventory playerInventory,
+            boolean includePlayerInventory, List<ItemStack> ingredients, int tradeCount) {
+        if (tradeCount <= 0) {
+            return false;
+        }
         MatchCache matchCache = new MatchCache();
         if (ingredients == null || ingredients.isEmpty()) {
             return false;
@@ -568,7 +755,8 @@ public class EconomyListener implements Listener {
         List<ItemStack> requiredIngredients = aggregateIngredients(ingredients, tradeCount);
         for (ItemStack ingredient : requiredIngredients) {
             int required = ingredient.getAmount();
-            int available = countAvailableIngredients(event, ingredient, includePlayerInventory, matchCache);
+            int available = countAvailableIngredients(merchantInventory, playerInventory, ingredient,
+                    includePlayerInventory, matchCache);
             if (available < required) {
                 return false;
             }
@@ -629,11 +817,14 @@ public class EconomyListener implements Listener {
     }
 
     private boolean scheduleSecondIngredientCleanup(InventoryClickEvent event, TradingRecipe recipe, int tradeCount) {
+        return scheduleSecondIngredientCleanup(getMerchantInventory(event), recipe, tradeCount);
+    }
+
+    private boolean scheduleSecondIngredientCleanup(Inventory merchantInventory, TradingRecipe recipe, int tradeCount) {
         ItemStack ingredient = getSecondIngredient(recipe);
         if (ingredient == null) {
             return true;
         }
-        Inventory merchantInventory = getMerchantInventory(event);
         MatchCache matchCache = new MatchCache();
         int required = ingredient.getAmount() * tradeCount;
         int before = countMatchingInput(merchantInventory, ingredient, matchCache);
@@ -694,6 +885,14 @@ public class EconomyListener implements Listener {
         return event == null ? null : event.getWhoClicked().getInventory();
     }
 
+    private MerchantInventory getOpenMerchantInventory(Player player) {
+        if (player == null || player.getOpenInventory() == null) {
+            return null;
+        }
+        Inventory topInventory = player.getOpenInventory().getTopInventory();
+        return topInventory instanceof MerchantInventory merchantInventory ? merchantInventory : null;
+    }
+
     private Inventory getMerchantInventory(InventoryClickEvent event) {
         if (event == null || event.getView() == null) {
             return null;
@@ -739,15 +938,30 @@ public class EconomyListener implements Listener {
 
     private int countAvailableIngredients(InventoryClickEvent event, ItemStack target,
             boolean includePlayerInventory, MatchCache matchCache) {
-        int available = countMatchingInput(getMerchantInventory(event), target, matchCache);
+        return countAvailableIngredients(getMerchantInventory(event), getPlayerInventory(event), target,
+                includePlayerInventory, matchCache);
+    }
+
+    private int countAvailableIngredients(Inventory merchantInventory, Inventory playerInventory, ItemStack target,
+            boolean includePlayerInventory, MatchCache matchCache) {
+        int available = countMatchingInput(merchantInventory, target, matchCache);
         if (includePlayerInventory) {
-            available += countMatching(getPlayerInventory(event), target, matchCache);
+            available += countMatching(playerInventory, target, matchCache);
         }
         return available;
     }
 
     private void scheduleIngredientCleanup(Inventory merchantInventory, List<ItemStack> targets,
             List<Integer> expectedRemaining) {
+        if (merchantInventory == null || targets == null || expectedRemaining == null) {
+            debugLog("Skipped ingredient cleanup: merchant inventory, targets, or expected remaining list was null");
+            return;
+        }
+        if (targets.size() != expectedRemaining.size()) {
+            debugLog("Skipped ingredient cleanup: targets and expected remaining list sizes differed (targets="
+                    + targets.size() + ", expected=" + expectedRemaining.size() + ")");
+            return;
+        }
         if (targets.isEmpty()) {
             return;
         }
@@ -840,22 +1054,22 @@ public class EconomyListener implements Listener {
                 && targetProfile.craftEngineId.equals(itemProfile.craftEngineId)) {
             return true;
         }
-        if (targetProfile.itemModel != null && targetProfile.itemModel.equals(itemProfile.itemModel)
-                && sameCustomModelData(itemProfile, targetProfile)) {
-            return true;
+        if (targetProfile.itemModel != null && targetProfile.itemModel.equals(itemProfile.itemModel)) {
+            return targetProfile.customModelData == null || sameCustomModelData(itemProfile, targetProfile);
         }
-        return sameCustomModelData(itemProfile, targetProfile);
+        return targetProfile.customModelData != null && sameCustomModelData(itemProfile, targetProfile);
     }
 
     private boolean sameCustomModelData(MatchProfile item, MatchProfile target) {
-        return target.customModelData != null && target.customModelData.equals(item.customModelData);
+        return Objects.equals(target.customModelData, item.customModelData);
     }
 
     private MatchProfile createMatchProfile(ItemStack item) {
+        ItemMeta meta = item == null ? null : item.getItemMeta();
         String metaString = getMetaString(item);
         return new MatchProfile(
-                getMetaValue(metaString, "craftengine:id"),
-                getFirstMetaValue(metaString, "minecraft:item_model", "item_model"),
+                getCraftEngineIdValue(meta, metaString),
+                getItemModelValue(meta, metaString),
                 getCustomModelDataValue(item, metaString));
     }
 
@@ -877,6 +1091,70 @@ public class EconomyListener implements Listener {
             this.itemModel = itemModel;
             this.customModelData = customModelData;
         }
+    }
+
+    private String getCraftEngineIdValue(ItemMeta meta, String metaString) {
+        String value = getPersistentStringValue(meta, "craftengine:id");
+        if (value != null) {
+            return normalizeIdentifier(value);
+        }
+        value = getPersistentStringValue(meta, "craftengine:item_id");
+        if (value != null) {
+            return normalizeIdentifier(value);
+        }
+        return normalizeIdentifier(getMetaValue(metaString, "craftengine:id"));
+    }
+
+    private String getItemModelValue(ItemMeta meta, String metaString) {
+        Object itemModel = invokeMetaMethod(meta, "getItemModel");
+        if (itemModel != null) {
+            return normalizeIdentifier(itemModel.toString());
+        }
+        String value = getPersistentStringValue(meta, "minecraft:item_model");
+        if (value != null) {
+            return normalizeIdentifier(value);
+        }
+        return normalizeIdentifier(getFirstMetaValue(metaString, "minecraft:item_model", "item_model"));
+    }
+
+    private String getPersistentStringValue(ItemMeta meta, String key) {
+        if (meta == null || key == null) {
+            return null;
+        }
+        try {
+            NamespacedKey namespacedKey = NamespacedKey.fromString(key);
+            if (namespacedKey == null) {
+                return null;
+            }
+            String value = meta.getPersistentDataContainer().get(namespacedKey, PersistentDataType.STRING);
+            return value == null || value.isBlank() ? null : value;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Object invokeMetaMethod(ItemMeta meta, String methodName) {
+        if (meta == null) {
+            return null;
+        }
+        try {
+            Method method = meta.getClass().getMethod(methodName);
+            return method.invoke(meta);
+        } catch (ReflectiveOperationException | SecurityException ignored) {
+            return null;
+        }
+    }
+
+    private String normalizeIdentifier(String value) {
+        if (value == null) {
+            return null;
+        }
+        String normalized = value.trim();
+        if ((normalized.startsWith("\"") && normalized.endsWith("\""))
+                || (normalized.startsWith("'") && normalized.endsWith("'"))) {
+            normalized = normalized.substring(1, normalized.length() - 1).trim();
+        }
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private String getCustomModelDataValue(ItemStack item, String metaString) {
@@ -1003,19 +1281,45 @@ public class EconomyListener implements Listener {
     }
 
     private String extractMetaValue(String meta, String key) {
-        int keyIndex = meta.indexOf(key);
-        if (keyIndex < 0) {
-            return null;
+        int searchFrom = 0;
+        while (searchFrom < meta.length()) {
+            int keyIndex = meta.indexOf(key, searchFrom);
+            if (keyIndex < 0) {
+                return null;
+            }
+            int valueStart = getMetaValueSeparator(meta, keyIndex, key);
+            if (valueStart >= 0) {
+                return extractMetaValueAt(meta, valueStart + 1);
+            }
+            searchFrom = keyIndex + key.length();
         }
-        int valueStart = meta.indexOf(':', keyIndex + key.length());
-        int equalsStart = meta.indexOf('=', keyIndex + key.length());
-        if (valueStart < 0 || (equalsStart >= 0 && equalsStart < valueStart)) {
-            valueStart = equalsStart;
+        return null;
+    }
+
+    private int getMetaValueSeparator(String meta, int keyIndex, String key) {
+        if (!isMetaKeyBoundary(meta, keyIndex - 1)) {
+            return -1;
         }
-        if (valueStart < 0) {
-            return null;
+        int index = keyIndex + key.length();
+        while (index < meta.length() && Character.isWhitespace(meta.charAt(index))) {
+            index++;
         }
-        valueStart++;
+        if (index >= meta.length()) {
+            return -1;
+        }
+        char separator = meta.charAt(index);
+        return separator == ':' || separator == '=' ? index : -1;
+    }
+
+    private boolean isMetaKeyBoundary(String meta, int index) {
+        if (index < 0) {
+            return true;
+        }
+        char ch = meta.charAt(index);
+        return !Character.isLetterOrDigit(ch) && ch != '_' && ch != '-' && ch != ':';
+    }
+
+    private String extractMetaValueAt(String meta, int valueStart) {
         while (valueStart < meta.length()) {
             char ch = meta.charAt(valueStart);
             if (ch != ' ' && ch != '\"' && ch != '\\' && ch != '\'' && ch != '{' && ch != '=') {
